@@ -1,0 +1,15 @@
+{
+  "name": "truterra-lead-analyzer",
+  "version": "1.0.0",
+  "description": "TruTerra GHL lead -> Land Portal parcel analysis -> Claude note",
+  "private": true,
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "devDependencies": {
+    "vercel": "^37.0.0"
+  }
+}
