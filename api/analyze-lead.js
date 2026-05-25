@@ -1,27 +1,13 @@
-/**
- * TruTerra Lead Analyzer - Vercel Serverless Function
- *
- * Flow:
- * 1. Receives GHL webhook (new Facebook lead form submission)
- * 2. Extracts property address from form fields
- * 3. Searches Land Portal for parcel -> gets propertyid + fips
- * 4. Fetches full property data from Land Portal
- * 5. Requests comp report (async, non-blocking)
- * 6. Sends all data to Claude for synthesis
- * 7. Posts structured note back to GHL contact
- */
-
 const LP_BASE = "https://landportal.com/wp-json/lp-rest-api/v1";
 const LP_JWT = process.env.LAND_PORTAL_JWT;
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_BASE = "https://services.leadconnectorhq.com";
 const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-async function lpSearch(address, city, state) {
+async function lpSearch(address, state) {
   const searchUrl = `${LP_BASE}/search?type=parcelnumb&query=${encodeURIComponent(address)}&state=${state}`;
   const res = await fetch(searchUrl, { headers: { Authorization: `Bearer ${LP_JWT}` } });
   const json = await res.json();
-
   if (!json.success || !json.data?.features?.length) {
     const shortQuery = address.split(" ").slice(0, 3).join(" ");
     const fallbackUrl = `${LP_BASE}/search?type=owner&query=${encodeURIComponent(shortQuery)}&state=${state}`;
@@ -52,6 +38,11 @@ async function lpQueueCompReport(propertyid, fips) {
 
 async function synthesizeWithClaude(leadData, parcelData, compTask) {
   const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "2-digit", day: "2-digit" });
+
+  // If no API key, fall back to structured raw note
+  if (!CLAUDE_API_KEY) {
+    return buildRawNote(leadData, parcelData, compTask, today);
+  }
 
   const prompt = `You are a land acquisition analyst for TruTerra Group, a land advisory and wholesale company in Tennessee.
 A new inbound seller lead has come in via Facebook. Analyze the data below and write a concise, structured lead note for the CRM.
@@ -88,19 +79,66 @@ COMP REPORT: [Task ID if queued, else Not queued]
 ANALYST NOTES:
 [2-4 sentences. Cover: sellers stated reason, absentee owner flag, acreage/opportunity size, any data gaps, recommended next action for the TruTerra team.]`;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1024, messages: [{ role: "user", content: prompt }] }),
-  });
-  const json = await res.json();
-  return json.content?.[0]?.text || "Note generation failed.";
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const json = await res.json();
+    console.log("Anthropic response status:", res.status);
+    console.log("Anthropic response:", JSON.stringify(json));
+
+    if (json.content?.[0]?.text) {
+      return json.content[0].text;
+    }
+
+    // API returned but no content — fall back to raw note with error details
+    console.error("Anthropic API error:", json.error?.message || JSON.stringify(json));
+    return buildRawNote(leadData, parcelData, compTask, today, json.error?.message);
+  } catch (err) {
+    console.error("Anthropic fetch error:", err.message);
+    return buildRawNote(leadData, parcelData, compTask, today, err.message);
+  }
+}
+
+function buildRawNote(leadData, parcelData, compTask, today, errorMsg) {
+  const p = parcelData || {};
+  return `PARCEL ANALYSIS - Auto-generated ${today}
+
+ADDRESS: ${p.situsfullstreetaddress || leadData.propertyAddress || "Unknown"}, ${p.situscity || ""} ${p.situsstate || ""} ${p.situszip5 || ""}
+APN: ${p.apn || "Not found"}
+FIPS: ${p.fips || "Unknown"}
+OWNER OF RECORD: ${p.ownername1full || "Unknown"}
+ACREAGE: ${p.lotsizeacres || "Unknown"} ac
+ZONING: ${p.zoning || p.landusecode || "Unknown"}
+LAST SALE: ${p.currentsalerecordingdate ? `${p.currentsalerecordingdate} / $${p.currentsaleprice || "Unknown"}` : "Unknown"}
+ASSESSED VALUE: ${p.assessedtotalvalue ? `$${p.assessedtotalvalue}` : "Unknown"}
+ABSENTEE OWNER: ${p.mailingfullstreetaddress && p.situsfullstreetaddress && p.mailingfullstreetaddress !== p.situsfullstreetaddress ? "Yes" : "Unknown"}
+
+COMP REPORT: ${compTask ? `Task #${compTask.task_id} queued` : "Not queued"}
+
+LEAD REASON: ${leadData.reason || "Not provided"}
+${errorMsg ? `\nNOTE: AI synthesis unavailable (${errorMsg}). Raw parcel data shown above.` : ""}`;
 }
 
 async function ghlAddNote(contactId, body) {
   const res = await fetch(`${GHL_BASE}/contacts/${contactId}/notes`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${GHL_API_KEY}`, "Content-Type": "application/json", Version: "2021-07-28" },
+    headers: {
+      Authorization: `Bearer ${GHL_API_KEY}`,
+      "Content-Type": "application/json",
+      Version: "2021-07-28",
+    },
     body: JSON.stringify({ body }),
   });
   return res.json();
@@ -147,10 +185,15 @@ export default async function handler(req, res) {
     const payload = req.body;
     const lead = parseGHLWebhook(payload);
 
+    console.log("Lead parsed:", JSON.stringify(lead));
+    console.log("ANTHROPIC_API_KEY present:", !!CLAUDE_API_KEY, "length:", CLAUDE_API_KEY?.length);
+    console.log("GHL_API_KEY present:", !!GHL_API_KEY);
+    console.log("LP_JWT present:", !!LP_JWT);
+
     if (!lead.contactId) return res.status(400).json({ error: "No contact ID in payload" });
     if (!lead.propertyAddress) return res.status(200).json({ message: "No property address, skipped" });
 
-    const searchResult = await lpSearch(lead.street, lead.city, lead.state);
+    const searchResult = await lpSearch(lead.street, lead.state);
     let parcelData = null;
     let compTask = null;
 
@@ -160,7 +203,10 @@ export default async function handler(req, res) {
     }
 
     const note = await synthesizeWithClaude(lead, parcelData, compTask);
+    console.log("Note generated, length:", note?.length);
+
     const ghlResult = await ghlAddNote(lead.contactId, note);
+    console.log("GHL note result:", JSON.stringify(ghlResult));
 
     return res.status(200).json({
       success: true,
@@ -170,6 +216,7 @@ export default async function handler(req, res) {
       notePosted: !!ghlResult,
     });
   } catch (err) {
+    console.error("Handler error:", err);
     return res.status(500).json({ error: err.message });
   }
 }
