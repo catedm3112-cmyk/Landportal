@@ -4,19 +4,38 @@ const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_BASE = "https://services.leadconnectorhq.com";
 const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-async function lpSearch(address, state) {
-  const searchUrl = `${LP_BASE}/search?type=parcelnumb&query=${encodeURIComponent(address)}&state=${state}`;
-  const res = await fetch(searchUrl, { headers: { Authorization: `Bearer ${LP_JWT}` } });
-  const json = await res.json();
-  if (!json.success || !json.data?.features?.length) {
-    const shortQuery = address.split(" ").slice(0, 3).join(" ");
-    const fallbackUrl = `${LP_BASE}/search?type=owner&query=${encodeURIComponent(shortQuery)}&state=${state}`;
-    const fallbackRes = await fetch(fallbackUrl, { headers: { Authorization: `Bearer ${LP_JWT}` } });
-    const fallbackJson = await fallbackRes.json();
-    if (!fallbackJson.success || !fallbackJson.data?.features?.length) return null;
-    return fallbackJson.data.features[0].properties;
+async function lpSearch(street, city, state, zip) {
+  // Try full address first with city+state narrowing
+  const queries = [
+    `${street} ${city}`,
+    street,
+    street.split(" ").slice(0, 3).join(" ")
+  ];
+
+  for (const q of queries) {
+    const url = `${LP_BASE}/search?type=parcelnumb&query=${encodeURIComponent(q)}&state=${state}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${LP_JWT}` } });
+    const json = await res.json();
+    if (json.success && json.data?.features?.length) {
+      // Filter by city match if possible
+      const features = json.data.features;
+      const cityMatch = features.find(f =>
+        f.properties?.city?.toLowerCase() === city?.toLowerCase() ||
+        f.properties?.zip === zip
+      );
+      return (cityMatch || features[0]).properties;
+    }
   }
-  return json.data.features[0].properties;
+
+  // Fallback: owner search
+  const ownerUrl = `${LP_BASE}/search?type=owner&query=${encodeURIComponent(street.split(" ").slice(0, 3).join(" "))}&state=${state}`;
+  const ownerRes = await fetch(ownerUrl, { headers: { Authorization: `Bearer ${LP_JWT}` } });
+  const ownerJson = await ownerRes.json();
+  if (ownerJson.success && ownerJson.data?.features?.length) {
+    return ownerJson.data.features[0].properties;
+  }
+
+  return null;
 }
 
 async function lpPropertyData(propertyid, fips) {
@@ -39,9 +58,8 @@ async function lpQueueCompReport(propertyid, fips) {
 async function synthesizeWithClaude(leadData, parcelData, compTask) {
   const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "2-digit", day: "2-digit" });
 
-  // If no API key, fall back to structured raw note
   if (!CLAUDE_API_KEY) {
-    return buildRawNote(leadData, parcelData, compTask, today);
+    return buildRawNote(leadData, parcelData, compTask, today, "No API key configured");
   }
 
   const prompt = `You are a land acquisition analyst for TruTerra Group, a land advisory and wholesale company in Tennessee.
@@ -58,7 +76,7 @@ LAND PORTAL PARCEL DATA:
 ${parcelData ? JSON.stringify(parcelData, null, 2) : "Parcel not found in Land Portal for this address."}
 
 COMP REPORT:
-${compTask ? `Queued - Task ID: ${compTask.task_id} (results will be available in Land Portal dashboard)` : "Not queued - parcel lookup failed"}
+${compTask ? `Queued - Task ID: ${compTask.task_id} (results available in Land Portal dashboard)` : "Not queued - parcel lookup failed"}
 
 Write a lead note using EXACTLY this format - plain text only, no markdown, no # headers:
 
@@ -83,39 +101,36 @@ ANALYST NOTES:
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "x-api-key": CLAUDE_API_KEY,
+        "x-api-key": CLAUDE_API_KEY.trim(),
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
         messages: [{ role: "user", content: prompt }],
       }),
     });
 
     const json = await res.json();
-    console.log("Anthropic response status:", res.status);
-    console.log("Anthropic response:", JSON.stringify(json));
+    console.log("Anthropic status:", res.status, "error:", json.error?.message);
 
-    if (json.content?.[0]?.text) {
-      return json.content[0].text;
-    }
-
-    // API returned but no content — fall back to raw note with error details
-    console.error("Anthropic API error:", json.error?.message || JSON.stringify(json));
-    return buildRawNote(leadData, parcelData, compTask, today, json.error?.message);
+    if (json.content?.[0]?.text) return json.content[0].text;
+    return buildRawNote(leadData, parcelData, compTask, today, json.error?.message || `HTTP ${res.status}`);
   } catch (err) {
-    console.error("Anthropic fetch error:", err.message);
+    console.error("Anthropic error:", err.message);
     return buildRawNote(leadData, parcelData, compTask, today, err.message);
   }
 }
 
 function buildRawNote(leadData, parcelData, compTask, today, errorMsg) {
   const p = parcelData || {};
+  const mailingDiffers = p.mailingfullstreetaddress && p.situsfullstreetaddress &&
+    p.mailingfullstreetaddress.trim().toLowerCase() !== p.situsfullstreetaddress.trim().toLowerCase();
+
   return `PARCEL ANALYSIS - Auto-generated ${today}
 
-ADDRESS: ${p.situsfullstreetaddress || leadData.propertyAddress || "Unknown"}, ${p.situscity || ""} ${p.situsstate || ""} ${p.situszip5 || ""}
+ADDRESS: ${[p.situsfullstreetaddress, p.situscity, p.situsstate, p.situszip5].filter(Boolean).join(", ") || leadData.propertyAddress}
 APN: ${p.apn || "Not found"}
 FIPS: ${p.fips || "Unknown"}
 OWNER OF RECORD: ${p.ownername1full || "Unknown"}
@@ -123,12 +138,13 @@ ACREAGE: ${p.lotsizeacres || "Unknown"} ac
 ZONING: ${p.zoning || p.landusecode || "Unknown"}
 LAST SALE: ${p.currentsalerecordingdate ? `${p.currentsalerecordingdate} / $${p.currentsaleprice || "Unknown"}` : "Unknown"}
 ASSESSED VALUE: ${p.assessedtotalvalue ? `$${p.assessedtotalvalue}` : "Unknown"}
-ABSENTEE OWNER: ${p.mailingfullstreetaddress && p.situsfullstreetaddress && p.mailingfullstreetaddress !== p.situsfullstreetaddress ? "Yes" : "Unknown"}
+ABSENTEE OWNER: ${mailingDiffers ? "Yes" : p.mailingfullstreetaddress ? "No" : "Unknown"}
+MAILING ADDRESS: ${p.mailingfullstreetaddress || "Unknown"}
 
 COMP REPORT: ${compTask ? `Task #${compTask.task_id} queued` : "Not queued"}
 
 LEAD REASON: ${leadData.reason || "Not provided"}
-${errorMsg ? `\nNOTE: AI synthesis unavailable (${errorMsg}). Raw parcel data shown above.` : ""}`;
+${errorMsg ? `\n[AI synthesis error: ${errorMsg}]` : ""}`;
 }
 
 async function ghlAddNote(contactId, body) {
@@ -185,15 +201,13 @@ export default async function handler(req, res) {
     const payload = req.body;
     const lead = parseGHLWebhook(payload);
 
-    console.log("Lead parsed:", JSON.stringify(lead));
-    console.log("ANTHROPIC_API_KEY present:", !!CLAUDE_API_KEY, "length:", CLAUDE_API_KEY?.length);
-    console.log("GHL_API_KEY present:", !!GHL_API_KEY);
-    console.log("LP_JWT present:", !!LP_JWT);
+    console.log("Lead:", JSON.stringify(lead));
+    console.log("Keys - ANTHROPIC:", !!CLAUDE_API_KEY, "GHL:", !!GHL_API_KEY, "LP:", !!LP_JWT);
 
-    if (!lead.contactId) return res.status(400).json({ error: "No contact ID in payload" });
+    if (!lead.contactId) return res.status(400).json({ error: "No contact ID" });
     if (!lead.propertyAddress) return res.status(200).json({ message: "No property address, skipped" });
 
-    const searchResult = await lpSearch(lead.street, lead.state);
+    const searchResult = await lpSearch(lead.street, lead.city, lead.state, lead.zip);
     let parcelData = null;
     let compTask = null;
 
@@ -203,10 +217,7 @@ export default async function handler(req, res) {
     }
 
     const note = await synthesizeWithClaude(lead, parcelData, compTask);
-    console.log("Note generated, length:", note?.length);
-
     const ghlResult = await ghlAddNote(lead.contactId, note);
-    console.log("GHL note result:", JSON.stringify(ghlResult));
 
     return res.status(200).json({
       success: true,
