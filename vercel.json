@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "functions": {
+    "api/analyze-lead.js": {
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/analyze-lead",
+      "dest": "/api/analyze-lead.js"
+    }
+  ]
+}
