@@ -392,10 +392,12 @@ export default async function handler(req, res) {
       phone: lead.phone,
       source: lead.source,
       attributionSource: lead.attributionSource,
-      propertyAddress: lead.propertyAddress,
-      reasonForInquiry: lead.reason,
+      propertyAddress: lead.propertyAddress || null,
+      reasonForInquiry: lead.reason || null,
       existingTags: lead.tags,
-      rawPayload: payload.contact || payload,
+      // Pass all custom fields directly so classifier sees them regardless of shape
+      customFields: (payload.contact || payload)?.customField || 
+                    (payload.contact || payload)?.customData || {},
     });
 
     // ── STEP 2: Build and apply tags ────────────────────────────────────────
