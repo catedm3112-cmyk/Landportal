@@ -3,12 +3,34 @@
   "functions": {
     "api/analyze-lead.js": {
       "maxDuration": 60
+    },
+    "api/lead-intake-webhook.js": {
+      "maxDuration": 60
+    },
+    "api/enrich-property.js": {
+      "maxDuration": 60
     }
   },
   "routes": [
     {
       "src": "/api/analyze-lead",
       "dest": "/api/analyze-lead.js"
+    },
+    {
+      "src": "/api/health",
+      "dest": "/api/health.js"
+    },
+    {
+      "src": "/api/enrich-property",
+      "dest": "/api/enrich-property.js"
+    },
+    {
+      "src": "/api/lead-intake-webhook",
+      "dest": "/api/lead-intake-webhook.js"
+    },
+    {
+      "src": "/api/landportal-callback",
+      "dest": "/api/landportal-callback.js"
     }
   ]
 }
