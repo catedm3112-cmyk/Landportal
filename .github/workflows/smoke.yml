@@ -1,0 +1,44 @@
+name: Production smoke test
+
+# Pings the LIVE landportal endpoints and fails (red X + GitHub emails Dillon)
+# if production is broken. Runs after every push to main (waits for Vercel to
+# deploy first), every 6 hours as a continuous monitor, and on-demand.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch: {}      # manual "Run workflow" button
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Vercel deploy (only on push)
+        if: github.event_name == 'push'
+        run: sleep 120
+
+      - name: /api/health must return 200 + ok:true
+        run: |
+          set -e
+          body=$(curl -fsS https://landportal-coral.vercel.app/api/health)
+          echo "health: $body"
+          echo "$body" | grep -q '"ok":true' || { echo "::error::/api/health did not report ok:true"; exit 1; }
+
+      - name: /api/lead-intake-webhook must be alive (400 on empty body)
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Content-Type: application/json" -d '{}' \
+            https://landportal-coral.vercel.app/api/lead-intake-webhook)
+          echo "lead-intake-webhook empty-body status: $code"
+          [ "$code" = "400" ] || { echo "::error::lead-intake-webhook expected 400, got $code"; exit 1; }
+
+      - name: /api/analyze-lead must be alive (405 on GET)
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" https://landportal-coral.vercel.app/api/analyze-lead)
+          echo "analyze-lead GET status: $code"
+          [ "$code" = "405" ] || { echo "::error::analyze-lead expected 405, got $code"; exit 1; }
