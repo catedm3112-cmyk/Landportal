@@ -1,22 +1,33 @@
 /**
- * TruTerra Lead Analyzer + AI Classifier
+ * TruTerra Lead Analyzer + AI Classifier  —  Land Portal API v2
  * Vercel Serverless Function
  *
- * Flow:
- * 1. Receive GHL webhook (Contact Created)
- * 2. AI Classifier — reads all available context, returns structured decision
- * 3. Apply tags to contact
- * 4. Create/update opportunity in correct pipeline
- * 5. If seller lead → geocode → Land Portal parcel lookup + comp report
- * 6. AI synthesizes parcel note
- * 7. Post note to GHL contact
+ * Two entry points on one endpoint:
+ *
+ *   POST  /api/analyze-lead   ← GHL webhook (Contact Created / Form Submitted)
+ *         Flow: classify lead → tag → create opportunity → (seller) resolve
+ *         parcel → synthesize note → post note back to the GHL contact.
+ *
+ *   GET   /api/analyze-lead?apn=...&state=TN        ← manual, ad-hoc lookup
+ *         /api/analyze-lead?address=123 Main St, Sevierville TN
+ *         /api/analyze-lead?propertyId=78723946
+ *         /api/analyze-lead?lat=35.86&lng=-83.56
+ *         Returns the full parcel analysis as JSON. No GHL contact required.
+ *         Optionally pass &contactId=... to also post the note into GHL.
  */
 
-const LP_BASE = "https://landportal.com/wp-json/lp-rest-api/v1";
-const LP_JWT = process.env.LAND_PORTAL_JWT;
+import {
+  searchAndFetchProperty,
+  getPropertyByPoint,
+  getPropertyDetail,
+  searchProperties,
+  normalizeProperty,
+} from "../lib/landportal.js";
+
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_BASE = "https://services.leadconnectorhq.com";
 const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
+const LOCATION_ID = "EHl75N7YlN7nOMP30CYm";
 
 // User IDs
 const USERS = {
@@ -40,7 +51,6 @@ const STAGES = {
 
 // ─── ROUND ROBIN ─────────────────────────────────────────────────────────────
 
-// Simple alternating round robin based on timestamp parity
 function roundRobin(contactId) {
   const sum = contactId.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
   return sum % 2 === 0 ? USERS.dillon : USERS.chris;
@@ -65,7 +75,7 @@ Return ONLY a valid JSON object in this exact format, no other text:
   "pipeline": "leadIntake" | "investorBuyer" | "none",
   "run_parcel_analysis": true | false,
   "reasoning": "one sentence explanation of why you classified this way based only on available data",
-  "flags": [] 
+  "flags": []
 }
 
 Classification rules:
@@ -103,7 +113,6 @@ Set confidence to "low" if you are uncertain. Never assume type from pipeline pl
     return classification;
   } catch (err) {
     console.error("Classifier error:", err.message);
-    // Safe fallback — unclassified, needs manual review
     return {
       type: "unclassified",
       confidence: "low",
@@ -142,7 +151,7 @@ async function ghlCreateOpportunity(contactId, contactName, pipelineId, stageId,
     },
     body: JSON.stringify({
       pipelineId,
-      locationId: "EHl75N7YlN7nOMP30CYm",
+      locationId: LOCATION_ID,
       name: contactName,
       pipelineStageId: stageId,
       status: "open",
@@ -166,125 +175,173 @@ async function ghlAddNote(contactId, body) {
   return res.json();
 }
 
-// ─── LAND PORTAL ─────────────────────────────────────────────────────────────
+// ─── PARCEL RESOLUTION (Land Portal v2) ────────────────────────────────────────
 
 async function geocodeAddress(street, city, state, zip) {
-  const params = new URLSearchParams({ street, city, state, zip, benchmark: "2020", format: "json" });
+  const params = new URLSearchParams({ benchmark: "2020", format: "json" });
+  if (street) params.set("street", street);
+  if (city) params.set("city", city);
+  if (state) params.set("state", state);
+  if (zip) params.set("zip", zip);
   const res = await fetch(`https://geocoding.geo.census.gov/geocoder/locations/address?${params}`);
-  const json = await res.json();
-  const match = json.result?.addressMatches?.[0];
+  const json = await res.json().catch(() => null);
+  const match = json?.result?.addressMatches?.[0];
   if (!match) return null;
   return { lat: match.coordinates.y, lng: match.coordinates.x, matchedAddress: match.matchedAddress };
 }
 
-async function lpPropertyByCoords(lat, lng) {
-  const res = await fetch(`${LP_BASE}/property-data?lat=${lat}&lng=${lng}`, {
-    headers: { Authorization: `Bearer ${LP_JWT}` },
-  });
-  const json = await res.json();
-  return json.success ? json.data.property : null;
+// An APN tends to be a short token of digits/dashes/dots with no street words.
+function looksLikeApn(str) {
+  if (!str) return false;
+  const s = str.trim();
+  if (/\d/.test(s) === false) return false;
+  if (/,/.test(s)) return false;
+  if (/\b(st|street|rd|road|ave|avenue|dr|drive|ln|lane|hwy|highway|blvd|ct|court|way|pike|trail|cir|circle)\b/i.test(s)) return false;
+  // Mostly digits, dashes, dots, occasional letters; short.
+  return /^[A-Za-z0-9.\-\s]{4,30}$/.test(s) && (s.match(/\d/g) || []).length >= 3;
 }
 
-async function lpPropertyBySearch(street, city, state) {
-  const queries = [`${street} ${city}`, street, street.split(" ").slice(0, 3).join(" ")];
-  for (const q of queries) {
-    const res = await fetch(`${LP_BASE}/search?type=parcelnumb&query=${encodeURIComponent(q)}&state=${state}`, {
-      headers: { Authorization: `Bearer ${LP_JWT}` },
-    });
-    const json = await res.json();
-    if (json.success && json.data?.features?.length) {
-      const features = json.data.features;
-      const cityMatch = features.find(f => f.properties?.city?.toLowerCase() === city?.toLowerCase());
-      return (cityMatch || features[0]).properties;
+/**
+ * Resolve a parcel from any input.
+ * Returns { property (normalized | null), matchType, geo, raw }.
+ */
+async function resolveParcel({ apn, address, propertyId, lat, lng, state = "TN" }) {
+  // Direct property_id
+  if (propertyId) {
+    const detail = await getPropertyDetail(propertyId);
+    return { property: detail.property ? normalizeProperty(detail.property) : null, matchType: "property_id", geo: null };
+  }
+
+  // Explicit coordinates
+  if (lat != null && lng != null) {
+    const { feature } = await getPropertyByPoint(lat, lng);
+    const match = feature?.properties;
+    if (!match?.property_id) return { property: null, matchType: "point", geo: { lat, lng } };
+    const detail = await getPropertyDetail(match.property_id);
+    return { property: normalizeProperty(detail.property, match), matchType: "point", geo: { lat, lng } };
+  }
+
+  // APN search → detail (precise)
+  if (apn) {
+    const { features } = await searchProperties({ apn, state });
+    const match = features[0]?.properties;
+    if (match?.property_id) {
+      const detail = await getPropertyDetail(match.property_id);
+      return { property: normalizeProperty(detail.property, match), matchType: "apn", geo: null };
     }
-  }
-  return null;
-}
-
-async function lpPropertyData(propertyid, fips) {
-  const res = await fetch(`${LP_BASE}/property-data?propertyid=${propertyid}&fips=${fips}`, {
-    headers: { Authorization: `Bearer ${LP_JWT}` },
-  });
-  const json = await res.json();
-  return json.success ? json.data.property : null;
-}
-
-async function lpQueueCompReport(propertyid, fips) {
-  const res = await fetch(`${LP_BASE}/reports`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${LP_JWT}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ propertyid, fips }),
-  });
-  const json = await res.json();
-  return json.success ? json.data : null;
-}
-
-async function getParcelData(lead) {
-  const geo = await geocodeAddress(lead.street, lead.city, lead.state, lead.zip);
-  console.log("Geocode:", JSON.stringify(geo));
-
-  if (geo?.lat && geo?.lng) {
-    const parcel = await lpPropertyByCoords(geo.lat, geo.lng);
-    if (parcel) return { parcel, geo };
+    return { property: null, matchType: "apn", geo: null };
   }
 
-  const searchResult = await lpPropertyBySearch(lead.street, lead.city, lead.state);
-  if (searchResult?.propertyid && searchResult?.fips) {
-    const parcel = await lpPropertyData(searchResult.propertyid, searchResult.fips);
-    return { parcel, geo: geo || null };
+  // Address → geocode → point lookup (v2 text address search is unreliable, so
+  // resolve the address to coordinates first, then ask Land Portal what's there).
+  if (address) {
+    if (looksLikeApn(address)) {
+      const r = await resolveParcel({ apn: address, state });
+      if (r.property) return r;
+    }
+    const parts = address.replace(/,/g, " ").trim().split(/\s+/);
+    const zip = /^\d{5}$/.test(parts[parts.length - 1]) ? parts[parts.length - 1] : "";
+    const geo = await geocodeAddress(address, "", state, zip);
+    if (geo?.lat && geo?.lng) {
+      const { feature } = await getPropertyByPoint(geo.lat, geo.lng);
+      const match = feature?.properties;
+      if (match?.property_id) {
+        const detail = await getPropertyDetail(match.property_id);
+        return { property: normalizeProperty(detail.property, match), matchType: "address_point", geo };
+      }
+    }
+    return { property: null, matchType: "address", geo };
   }
 
-  return { parcel: null, geo: geo || null };
+  return { property: null, matchType: "none", geo: null };
 }
 
-// ─── PARCEL NOTE SYNTHESIS ───────────────────────────────────────────────────
+// ─── NOTE SYNTHESIS ───────────────────────────────────────────────────────────
 
-async function synthesizeParcelNote(leadData, parcelData, compTask, geo, classification) {
+function fmtMoney(n) {
+  if (n == null || n === "") return "Unknown";
+  const num = Number(n);
+  return Number.isFinite(num) ? `$${num.toLocaleString("en-US")}` : "Unknown";
+}
+function fmtPct(n) {
+  if (n == null || n === "") return "Unknown";
+  const num = Number(n);
+  return Number.isFinite(num) ? `${num.toFixed(1)}%` : "Unknown";
+}
+
+function isAbsentee(p) {
+  if (!p?.mailingState || !p?.situsState) return null;
+  if (p.mailingState.trim().toUpperCase() !== p.situsState.trim().toUpperCase()) return true;
+  if (p.mailingCity && p.situsCity) {
+    return p.mailingCity.trim().toUpperCase() !== p.situsCity.trim().toUpperCase();
+  }
+  return false;
+}
+
+function compsSummary(comps) {
+  if (!comps?.length) return "None returned";
+  return comps
+    .slice(0, 4)
+    .map((c) => `${c.area_acres ?? "?"} ac @ ${fmtMoney(c.price)} (${fmtMoney(c.price_per_acre)}/ac, ${c.mls_status || "n/a"})`)
+    .join("; ");
+}
+
+function buildStructuredNote(p, ctx = {}) {
   const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "2-digit", day: "2-digit" });
+  if (!p) {
+    return `PARCEL ANALYSIS - Auto-generated ${today}\n\nNo parcel match found for: ${ctx.inputLabel || "unknown input"}\n\n${ctx.errorMsg ? `[note: ${ctx.errorMsg}]` : "Verify the APN/address and try again."}`;
+  }
 
-  if (!CLAUDE_API_KEY) return buildRawNote(leadData, parcelData, compTask, today, geo, "No API key");
+  const absentee = isAbsentee(p);
+  const situs = [p.situsAddress, p.situsCity, p.situsState, p.situsZip].filter(Boolean).join(", ");
+  const mailing = [p.mailingAddress, p.mailingCity, p.mailingState, p.mailingZip].filter(Boolean).join(", ");
 
-  const prompt = `You are a land acquisition analyst for TruTerra Group in Tennessee.
-A new inbound seller lead has been classified and their parcel data retrieved. Write a CRM note.
+  return `PARCEL ANALYSIS - Auto-generated ${today}
 
-LEAD:
-- Name: ${leadData.firstName} ${leadData.lastName}
-- Email: ${leadData.email}
-- Phone: ${leadData.phone}
-- Reason: ${leadData.reason}
-- Submitted Address: ${leadData.propertyAddress}
-- Geocoded Address: ${geo?.matchedAddress || "Could not geocode"}
+ADDRESS: ${situs || ctx.geoAddress || ctx.inputLabel || "Unknown"}
+APN: ${p.apn || "Not found"}
+COUNTY / FIPS: ${p.situsCounty || "Unknown"} / ${p.fips || "Unknown"}
+OWNER OF RECORD: ${p.ownerName || "Unknown"}
+ACREAGE: ${p.lotSizeAcres != null ? `${p.lotSizeAcres} ac` : "Unknown"}
+LAND USE: ${p.landUseDescription || p.landUseCode || "Unknown"}
+LEGAL: ${p.legalDescription || "Unknown"}
 
-AI CLASSIFICATION:
-- Type: ${classification.type}
-- Confidence: ${classification.confidence}
-- Reasoning: ${classification.reasoning}
-- Flags: ${classification.flags?.join(", ") || "none"}
+VALUE
+  Assessed (total): ${fmtMoney(p.assessedTotalValue)}
+  Market (total):   ${fmtMoney(p.marketTotalValue)}
+  Land Portal est.: ${fmtMoney(p.tlpEstimate)}${p.tlpPricePerAcre != null ? ` (${fmtMoney(p.tlpPricePerAcre)}/ac)` : ""}
+
+OWNERSHIP
+  Absentee owner: ${absentee == null ? "Unknown" : absentee ? "YES" : "No"}
+  Mailing addr:   ${mailing || "Unknown"}
+
+SITE
+  Road frontage:  ${p.roadFrontage != null ? `${p.roadFrontage} ft` : "Unknown"}
+  Land-locked:    ${p.landLocked == null ? "Unknown" : p.landLocked ? "YES" : "No"}
+  Flood (FEMA %): ${fmtPct(p.femaCoverPercentage)}${p.floodZone ? ` — ${String(p.floodZone).slice(0, 80)}` : ""}
+  Wetlands %:     ${fmtPct(p.wetlandsCoverPercentage)}
+  Water feature:  ${p.waterFeaturePresent == null ? "Unknown" : p.waterFeaturePresent ? `Yes (${(p.nearbyWaterTypes || []).join(", ") || "unspecified"})` : "No"}
+
+TERRAIN
+  Avg slope:      ${p.slopeAverage != null ? `${p.slopeAverage}%` : "Unknown"}
+  Buildable:      ${fmtPct(p.buildabilityPercentage)}${p.buildabilityAcres != null ? ` (~${p.buildabilityAcres} ac)` : ""}
+
+COMPS: ${compsSummary(p.comps)}
+${ctx.analyst ? `\nANALYST NOTES:\n${ctx.analyst}` : ""}${ctx.errorMsg ? `\n\n[AI synthesis unavailable: ${ctx.errorMsg}]` : ""}`;
+}
+
+async function synthesizeParcelNote(p, ctx = {}) {
+  if (!p || !CLAUDE_API_KEY) {
+    return buildStructuredNote(p, { ...ctx, errorMsg: !CLAUDE_API_KEY ? "No Claude API key" : ctx.errorMsg });
+  }
+
+  const prompt = `You are a land acquisition analyst for TruTerra Group in Sevier County, Tennessee.
+Write 3-5 sentences of ANALYST NOTES for the parcel below — opportunity size, buildability/slope reality, flood/water/access constraints, absentee-owner angle, and a recommended next action. Be direct and specific. Plain text only, no markdown.
+
+LEAD CONTEXT: ${ctx.leadContext || "Manual / ad-hoc lookup (no lead attached)"}
 
 PARCEL DATA:
-${parcelData ? JSON.stringify(parcelData, null, 2) : "Not found"}
-
-COMP REPORT: ${compTask ? `Task #${compTask.task_id} queued` : "Not queued"}
-
-Write a plain text note — no markdown, no # headers:
-
-PARCEL ANALYSIS - Auto-generated ${today}
-
-ADDRESS: [parcel address or geocoded or submitted]
-APN: [apn or Not found]
-FIPS: [fips or Unknown]
-OWNER OF RECORD: [ownername1full or Unknown]
-ACREAGE: [lotsizeacres or Unknown] ac
-ZONING: [zoning or landusecode or Unknown]
-LAST SALE: [date + price or Unknown]
-ASSESSED VALUE: [$value or Unknown]
-ABSENTEE OWNER: [Yes/No/Unknown]
-MAILING ADDRESS: [mailingfullstreetaddress or Unknown]
-
-COMP REPORT: [Task ID or Not queued]
-
-ANALYST NOTES:
-[2-4 sentences covering: seller reason, opportunity size, absentee flag, data gaps, recommended next action. Flag any address mismatch between submitted and parcel data.]`;
+${JSON.stringify(p, null, 2)}`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -296,40 +353,16 @@ ANALYST NOTES:
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 1024,
+        max_tokens: 600,
         messages: [{ role: "user", content: prompt }],
       }),
     });
     const json = await res.json();
-    if (json.content?.[0]?.text) return json.content[0].text;
-    return buildRawNote(leadData, parcelData, compTask, today, geo, json.error?.message);
+    const analyst = json.content?.[0]?.text?.trim();
+    return buildStructuredNote(p, { ...ctx, analyst: analyst || null, errorMsg: analyst ? null : json.error?.message });
   } catch (err) {
-    return buildRawNote(leadData, parcelData, compTask, today, geo, err.message);
+    return buildStructuredNote(p, { ...ctx, errorMsg: err.message });
   }
-}
-
-function buildRawNote(leadData, parcelData, compTask, today, geo, errorMsg) {
-  const p = parcelData || {};
-  const mailingDiffers = p.mailingfullstreetaddress && p.situsfullstreetaddress &&
-    p.mailingfullstreetaddress.trim().toLowerCase() !== p.situsfullstreetaddress.trim().toLowerCase();
-
-  return `PARCEL ANALYSIS - Auto-generated ${today}
-
-ADDRESS: ${[p.situsfullstreetaddress, p.situscity, p.situsstate, p.situszip5].filter(Boolean).join(", ") || geo?.matchedAddress || leadData.propertyAddress}
-APN: ${p.apn || "Not found"}
-FIPS: ${p.fips || "Unknown"}
-OWNER OF RECORD: ${p.ownername1full || "Unknown"}
-ACREAGE: ${p.lotsizeacres || "Unknown"} ac
-ZONING: ${p.zoning || p.landusecode || "Unknown"}
-LAST SALE: ${p.currentsalerecordingdate ? `${p.currentsalerecordingdate} / $${p.currentsaleprice || "Unknown"}` : "Unknown"}
-ASSESSED VALUE: ${p.assessedtotalvalue ? `$${p.assessedtotalvalue}` : "Unknown"}
-ABSENTEE OWNER: ${mailingDiffers ? "Yes" : p.mailingfullstreetaddress ? "No" : "Unknown"}
-MAILING ADDRESS: ${p.mailingfullstreetaddress || "Unknown"}
-
-COMP REPORT: ${compTask ? `Task #${compTask.task_id} queued` : "Not queued"}
-
-LEAD REASON: ${leadData.reason || "Not provided"}
-${errorMsg ? `\n[AI synthesis error: ${errorMsg}]` : ""}`;
 }
 
 // ─── PARSE GHL WEBHOOK ───────────────────────────────────────────────────────
@@ -347,12 +380,6 @@ function parseGHLWebhook(payload) {
     contact.reason_youre_inquiring ||
     contact.customData?.reason_youre_inquiring || "";
 
-  const addressParts = propertyAddress.trim().split(/\s+/);
-  const zip = addressParts[addressParts.length - 1];
-  const state = addressParts[addressParts.length - 2];
-  const city = addressParts[addressParts.length - 3];
-  const street = addressParts.slice(0, -3).join(" ");
-
   return {
     contactId: contact.id || payload.contact_id,
     firstName: contact.firstName || contact.first_name || "",
@@ -363,23 +390,78 @@ function parseGHLWebhook(payload) {
     tags: contact.tags || [],
     attributionSource: contact.attributionSource || {},
     reason,
-    propertyAddress,
-    street,
-    city,
-    state: state?.toUpperCase(),
-    zip,
+    propertyAddress: (propertyAddress || "").trim(),
   };
+}
+
+// ─── GET: manual / ad-hoc lookup ───────────────────────────────────────────────
+
+async function handleManualLookup(req, res) {
+  const q = req.query || {};
+  const apn = q.apn || q.parcel;
+  const address = q.address;
+  const propertyId = q.propertyId || q.propertyid;
+  const lat = q.lat != null ? Number(q.lat) : null;
+  const lng = q.lng != null ? Number(q.lng) : null;
+  const state = q.state || "TN";
+  const contactId = q.contactId || null;
+
+  if (!apn && !address && !propertyId && !(lat != null && lng != null)) {
+    return res.status(400).json({
+      success: false,
+      message: "Provide one of: apn, address, propertyId, or lat+lng.",
+      examples: [
+        "/api/analyze-lead?apn=02-1.0-11.0-2-001-010.01&state=MO",
+        "/api/analyze-lead?address=123 Main St, Sevierville TN",
+        "/api/analyze-lead?propertyId=78723946",
+      ],
+    });
+  }
+
+  const inputLabel = apn || address || propertyId || `${lat},${lng}`;
+  const { property, matchType, geo } = await resolveParcel({ apn, address, propertyId, lat, lng, state });
+
+  const note = await synthesizeParcelNote(property, {
+    inputLabel,
+    geoAddress: geo?.matchedAddress,
+    leadContext: `Manual lookup for ${inputLabel}`,
+  });
+
+  let notePosted = false;
+  if (contactId && property) {
+    await ghlAddNote(contactId, note);
+    notePosted = true;
+  }
+
+  return res.status(200).json({
+    success: !!property,
+    matchType,
+    parcelFound: !!property,
+    property,
+    note,
+    notePosted,
+  });
 }
 
 // ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method === "GET") {
+    try {
+      return await handleManualLookup(req, res);
+    } catch (err) {
+      console.error("Manual lookup error:", err);
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
     const payload = req.body;
     const lead = parseGHLWebhook(payload);
-
     console.log("Lead:", JSON.stringify(lead));
 
     if (!lead.contactId) return res.status(400).json({ error: "No contact ID" });
@@ -395,60 +477,59 @@ export default async function handler(req, res) {
       propertyAddress: lead.propertyAddress || null,
       reasonForInquiry: lead.reason || null,
       existingTags: lead.tags,
-      // Pass all custom fields directly so classifier sees them regardless of shape
-      customFields: (payload.contact || payload)?.customField || 
-                    (payload.contact || payload)?.customData || {},
+      customFields:
+        (payload.contact || payload)?.customField ||
+        (payload.contact || payload)?.customData || {},
     });
 
-    // ── STEP 2: Build and apply tags ────────────────────────────────────────
+    // ── STEP 2: Tags ──────────────────────────────────────────────────────────
     const tags = [
       `type:${classification.type}`,
       classification.source_tag,
       classification.campaign_tag,
-      ...(classification.flags || []).map(f => `flag:${f}`),
+      ...(classification.flags || []).map((f) => `flag:${f}`),
     ].filter(Boolean);
 
     await ghlAddTags(lead.contactId, tags);
     console.log("Tags applied:", tags);
 
-    // ── STEP 3: Create opportunity if applicable ─────────────────────────────
+    // ── STEP 3: Opportunity ─────────────────────────────────────────────────
     let opportunityResult = null;
     const assignedTo = roundRobin(lead.contactId);
     const contactName = `${lead.firstName} ${lead.lastName}`.trim();
 
     if (classification.pipeline === "leadIntake") {
       opportunityResult = await ghlCreateOpportunity(
-        lead.contactId, contactName,
-        PIPELINES.leadIntake, STAGES.leadIntake_newLead, assignedTo
+        lead.contactId, contactName, PIPELINES.leadIntake, STAGES.leadIntake_newLead, assignedTo
       );
     } else if (classification.pipeline === "investorBuyer") {
       opportunityResult = await ghlCreateOpportunity(
-        lead.contactId, contactName,
-        PIPELINES.investorBuyer, STAGES.investor_newLead, assignedTo
+        lead.contactId, contactName, PIPELINES.investorBuyer, STAGES.investor_newLead, assignedTo
       );
     }
-    // "none" = social engagement or not-a-lead — no opportunity created
-
     console.log("Opportunity:", JSON.stringify(opportunityResult));
 
     // ── STEP 4: Parcel analysis (seller leads only) ──────────────────────────
-    let parcel = null;
-    let geo = null;
-    let compTask = null;
+    let property = null;
     let note = null;
 
     if (classification.run_parcel_analysis && lead.propertyAddress) {
-      ({ parcel, geo } = await getParcelData(lead));
+      const resolved = await resolveParcel({
+        apn: looksLikeApn(lead.propertyAddress) ? lead.propertyAddress : undefined,
+        address: looksLikeApn(lead.propertyAddress) ? undefined : lead.propertyAddress,
+        state: "TN",
+      });
+      property = resolved.property;
 
-      if (parcel?.propertyid && parcel?.fips) {
-        compTask = await lpQueueCompReport(parcel.propertyid, parcel.fips);
-      }
-
-      note = await synthesizeParcelNote(lead, parcel, compTask, geo, classification);
+      note = await synthesizeParcelNote(property, {
+        inputLabel: lead.propertyAddress,
+        geoAddress: resolved.geo?.matchedAddress,
+        leadContext: `${contactName} — reason: ${lead.reason || "n/a"}; submitted: ${lead.propertyAddress}`,
+      });
       await ghlAddNote(lead.contactId, note);
     } else if (classification.type === "unclassified" || classification.flags?.includes("needs-manual-review")) {
-      // Post a simple flag note so the team knows to review
-      await ghlAddNote(lead.contactId,
+      await ghlAddNote(
+        lead.contactId,
         `LEAD CLASSIFICATION — ${new Date().toLocaleDateString("en-US")}\n\nType: UNCLASSIFIED — needs manual review\nReason: ${classification.reasoning}\nConfidence: ${classification.confidence}\nSource: ${lead.source || "Unknown"}\nAttribution: ${JSON.stringify(lead.attributionSource)}`
       );
     }
@@ -461,11 +542,9 @@ export default async function handler(req, res) {
       tagsApplied: tags,
       assignedTo,
       opportunityCreated: !!opportunityResult,
-      parcelFound: !!parcel,
-      compTaskId: compTask?.task_id || null,
+      parcelFound: !!property,
       notePosted: !!note,
     });
-
   } catch (err) {
     console.error("Handler error:", err);
     return res.status(500).json({ error: err.message });

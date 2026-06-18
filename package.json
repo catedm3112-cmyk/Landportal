@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "TruTerra GHL lead -> Land Portal parcel analysis -> Claude note",
   "private": true,
+  "type": "module",
   "engines": {
     "node": "20.x"
   },
