@@ -37,8 +37,14 @@ jobs:
           echo "lead-intake-webhook empty-body status: $code"
           [ "$code" = "400" ] || { echo "::error::lead-intake-webhook expected 400, got $code"; exit 1; }
 
-      - name: /api/analyze-lead must be alive (405 on GET)
+      - name: /api/analyze-lead must be alive (400 + usage hint on bare GET)
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" https://landportal-coral.vercel.app/api/analyze-lead)
-          echo "analyze-lead GET status: $code"
-          [ "$code" = "405" ] || { echo "::error::analyze-lead expected 405, got $code"; exit 1; }
+          # GET is now the manual lookup mode; a bare GET (no apn/address/etc)
+          # returns 400 with a usage hint, which confirms the endpoint is alive.
+          body=$(curl -s -w "\n%{http_code}" https://landportal-coral.vercel.app/api/analyze-lead)
+          code=$(echo "$body" | tail -n1)
+          payload=$(echo "$body" | sed '$d')
+          echo "analyze-lead bare-GET status: $code"
+          echo "analyze-lead bare-GET body: $payload"
+          [ "$code" = "400" ] || { echo "::error::analyze-lead expected 400, got $code"; exit 1; }
+          echo "$payload" | grep -q 'Provide one of' || { echo "::error::analyze-lead 400 missing expected usage hint"; exit 1; }
