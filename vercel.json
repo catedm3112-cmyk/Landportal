@@ -9,6 +9,9 @@
     },
     "api/enrich-property.js": {
       "maxDuration": 60
+    },
+    "api/pulse.js": {
+      "maxDuration": 60
     }
   },
   "routes": [
@@ -31,6 +34,16 @@
     {
       "src": "/api/landportal-callback",
       "dest": "/api/landportal-callback.js"
+    },
+    {
+      "src": "/api/pulse",
+      "dest": "/api/pulse.js"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/pulse",
+      "schedule": "0 12 * * *"
     }
   ]
 }
