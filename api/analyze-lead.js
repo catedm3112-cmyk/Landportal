@@ -56,6 +56,60 @@ function roundRobin(contactId) {
   return sum % 2 === 0 ? USERS.dillon : USERS.chris;
 }
 
+// ─── ROBUST JSON + RULE-BASED FALLBACK ───────────────────────────────────────
+
+// Models sometimes wrap JSON in ```fences``` or add a short preamble; pull the
+// JSON object out cleanly instead of trusting JSON.parse on the raw text.
+function extractJson(text) {
+  let t = String(text).trim();
+  t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  const first = t.indexOf("{");
+  const last = t.lastIndexOf("}");
+  if (first !== -1 && last > first) t = t.slice(first, last + 1);
+  return JSON.parse(t);
+}
+
+function isFacebookLead(c) {
+  const src = (c.source || "").toLowerCase();
+  const a = c.attributionSource || {};
+  return /facebook|fb|paid social/.test(src) ||
+    /facebook/i.test(a.medium || "") ||
+    /facebook/i.test(a.adSource || "") ||
+    !!a.formId || !!a.formName;
+}
+
+// Deterministic classifier used when the AI call fails. A Facebook land-form
+// lead — especially one with a submitted address — is unambiguously a seller
+// prospect. Never let an AI hiccup bury a real lead in "unclassified".
+function ruleClassify(contact) {
+  const fb = isFacebookLead(contact);
+  const hasAddress = !!(contact.propertyAddress && String(contact.propertyAddress).trim());
+  const source_tag = fb ? "src:facebook-lead" : "src:unknown";
+  if (fb || hasAddress) {
+    return {
+      type: "seller-prospect",
+      confidence: "low",
+      source_tag,
+      campaign_tag: "campaign:truterra",
+      pipeline: "leadIntake",
+      run_parcel_analysis: hasAddress,
+      reasoning: "Rule-based fallback (AI classifier unavailable): Facebook land-form lead" +
+        (hasAddress ? " with a submitted property address" : ""),
+      flags: ["ai-classifier-fallback"],
+    };
+  }
+  return {
+    type: "unclassified",
+    confidence: "low",
+    source_tag,
+    campaign_tag: "campaign:truterra",
+    pipeline: "leadIntake",
+    run_parcel_analysis: false,
+    reasoning: "Rule-based fallback: insufficient signals to classify",
+    flags: ["needs-manual-review"],
+  };
+}
+
 // ─── AI CLASSIFIER ───────────────────────────────────────────────────────────
 
 async function classifyLead(contact) {
@@ -105,24 +159,26 @@ Set confidence to "low" if you are uncertain. Never assume type from pipeline pl
     });
 
     const json = await res.json();
+    if (json.error) {
+      console.error("Anthropic API error:", res.status, JSON.stringify(json.error));
+      throw new Error(`Anthropic API ${res.status}: ${json.error?.message || "unknown"}`);
+    }
     const text = json.content?.[0]?.text?.trim();
     if (!text) throw new Error("No classifier response");
 
-    const classification = JSON.parse(text);
+    const classification = extractJson(text);
+    // A Facebook lead-form contact is always src:facebook-lead, even if the
+    // model guessed otherwise.
+    if (isFacebookLead(contact) && classification.source_tag === "src:unknown") {
+      classification.source_tag = "src:facebook-lead";
+    }
     console.log("Classification:", JSON.stringify(classification));
     return classification;
   } catch (err) {
     console.error("Classifier error:", err.message);
-    return {
-      type: "unclassified",
-      confidence: "low",
-      source_tag: "src:unknown",
-      campaign_tag: "campaign:truterra",
-      pipeline: "leadIntake",
-      run_parcel_analysis: false,
-      reasoning: "Classifier failed — manual review required",
-      flags: ["needs-manual-review"],
-    };
+    // Resilient fallback — classify from known signals instead of dumping
+    // every lead into manual-review limbo.
+    return ruleClassify(contact);
   }
 }
 
