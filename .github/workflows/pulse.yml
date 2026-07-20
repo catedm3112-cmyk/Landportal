@@ -1,0 +1,25 @@
+name: Pulse — lead accountability sweep
+
+# Drives the Pulse engine (api/pulse.js) on a near-real-time cadence. Vercel's
+# built-in cron caps at once/day on this plan, so we trigger the public endpoint
+# from GitHub Actions instead (free + unlimited on a public repo). Pulse is
+# idempotent, so running it often is safe — it never double-tasks a contact.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch:          # allow manual runs from the Actions tab
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Pulse sweep
+        run: |
+          echo "Pulse sweep at $(date -u)"
+          code=$(curl -s -o /tmp/pulse.json -w "%{http_code}" --max-time 90 \
+            "https://landportal-coral.vercel.app/api/pulse")
+          echo "HTTP $code"
+          cat /tmp/pulse.json || true
+          echo
+          test "$code" = "200"
