@@ -149,12 +149,16 @@ export default async function handler(req, res) {
       skipped: [],     // spam/suppressed or already has an open task
     };
 
+    // Contacts touched by the opp pass, so the conversation pass doesn't re-task them.
+    const handled = new Set();
+
     for (const opp of opps) {
       const contactId = opp.contactId;
       const name = opp.contact?.name || opp.name || contactId;
       const tags = opp.contact?.tags || [];
       const stage = opp.pipelineStageId;
       const conv = convByContact.get(contactId);
+      handled.add(contactId);
 
       const parked = PARKED_STAGES.has(stage) || CLOSED_STATUSES.has(opp.status);
       const active = ACTIVE_STAGES.has(stage) && opp.status === "open";
@@ -210,6 +214,31 @@ export default async function handler(req, res) {
 
       if (!dry) await createTask(contactId, title, body, owner);
       digest.needsUs.push({ name, reason, owner: owner === USERS.chris ? "Chris" : "Dillon", title });
+    }
+
+    // ── Second pass: engaged conversations with NO managed opp ────────────────
+    // Catches the "a lead reached out and nobody answered" case for people who
+    // never became an opportunity (e.g. a commenter who started messaging, like
+    // someone waiting on a promised email). Tightly gated to avoid noise: must be
+    // an unanswered inbound that GHL flags unread or past its response SLA, from a
+    // NAMED contact that isn't spam/suppressed/an anonymous caller.
+    for (const [contactId, conv] of convByContact) {
+      if (handled.has(contactId)) continue;
+      const name = (conv.fullName || conv.contactName || "").trim();
+      if (!name) continue;                              // anonymous → leave to spam/missed-call handling
+      if (hasSkipTag(conv.tags)) { digest.skipped.push({ name, reason: "spam/suppressed" }); continue; }
+      const inbound = conv.lastMessageDirection === "inbound";
+      const waiting = inbound && (conv.unreadCount > 0 || (conv.overdueAt && conv.overdueAt < now));
+      if (!waiting) continue;
+
+      const tasks = dry ? [] : await getContactTasks(contactId);
+      if (!dry && openTasks(tasks).length) { digest.skipped.push({ name, reason: "already has an open task" }); continue; }
+
+      const owner = [USERS.dillon, USERS.chris].includes(conv.assignedTo) ? conv.assignedTo : USERS.chris;
+      const title = `⏰ Reply to ${name} — waiting on us`;
+      const body = `${name} messaged and it's unanswered.${conv.lastMessageBody ? ` Last: "${String(conv.lastMessageBody).slice(0, 140)}"` : ""}`;
+      if (!dry) await createTask(contactId, title, body, owner);
+      digest.needsUs.push({ name, reason: "waiting on our reply (no opp yet)", owner: owner === USERS.chris ? "Chris" : "Dillon", title });
     }
 
     digest.summary = `${digest.needsUs.length} need us, ${digest.inMotion.length} in motion, ${digest.cleared.length} cleared, ${digest.skipped.length} skipped`;
