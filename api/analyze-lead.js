@@ -273,11 +273,99 @@ function looksLikeApn(str) {
   return /^[A-Za-z0-9.\-\s]{4,30}$/.test(s) && (s.match(/\d/g) || []).length >= 3;
 }
 
+// ─── Address candidate scoring ────────────────────────────────────────────────
+// Land Portal's native address search returns ~10 fuzzy candidates that include
+// near-miss decoys (opposite directional, wrong street type, off-by-N house
+// number). We score each against the submitted address (+ owner-name hint) and
+// only auto-attach a parcel when a candidate clears a confidence threshold —
+// attaching the WRONG parcel is worse than attaching none.
+
+const DIRECTIONALS = { EAST: "E", WEST: "W", NORTH: "N", SOUTH: "S", E: "E", W: "W", N: "N", S: "S" };
+const SUFFIXES = {
+  ROAD: "RD", RD: "RD", STREET: "ST", ST: "ST", AVENUE: "AVE", AVE: "AVE", DRIVE: "DR", DR: "DR",
+  LANE: "LN", LN: "LN", COURT: "CT", CT: "CT", BOULEVARD: "BLVD", BLVD: "BLVD", HIGHWAY: "HWY", HWY: "HWY",
+  PIKE: "PIKE", TRAIL: "TRL", TRL: "TRL", CIRCLE: "CIR", CIR: "CIR", PLACE: "PL", PL: "PL", WAY: "WAY",
+  PARKWAY: "PKWY", PKWY: "PKWY", TERRACE: "TER", TER: "TER", LOOP: "LOOP", COVE: "CV", CV: "CV",
+};
+
+function normToken(t) {
+  return String(t || "").toUpperCase().replace(/[.,]/g, "").trim();
+}
+
+// Parse a street string into { number, dir, suffix, core[], tokens[] }.
+function parseStreet(str) {
+  const raw = normToken(str).replace(/\s+/g, " ");
+  const tokens = raw ? raw.split(" ").filter(Boolean) : [];
+  let number = null, dir = null, suffix = null;
+  const core = [];
+  for (const tok of tokens) {
+    if (number == null && /^\d+$/.test(tok)) { number = tok; continue; }
+    if (DIRECTIONALS[tok] && dir == null) { dir = DIRECTIONALS[tok]; continue; }
+    if (SUFFIXES[tok]) { suffix = SUFFIXES[tok]; continue; }
+    if (/^\d{5}$/.test(tok)) continue;                 // zip
+    if (tok === "TN" || tok === "TENNESSEE") continue;
+    core.push(tok);
+  }
+  return { number, dir, suffix, core, tokens };
+}
+
+function slimFeature(f) {
+  const p = f?.properties || {};
+  return {
+    property_id: p.property_id, apn: p.apn ?? p.parcelnumb,
+    owner: p.owner_full_name ?? p.owner, street: p.street_address ?? p.address,
+    city: p.city, county: p.county, state: p.state,
+    acres: p.lot_size_acres ?? p.calc_acres,
+  };
+}
+
+// Score a candidate against the submitted address + optional owner hint.
+// Hard-rejects (0) on house-number or directional conflicts. Range ~0–130.
+function scoreCandidate(inp, cand, ownerHint) {
+  const c = parseStreet(cand.street || "");
+  if (!inp.number || !c.number || inp.number !== c.number) return 0;   // house number must match exactly
+  let score = 50;
+  if (inp.dir && c.dir) {
+    if (inp.dir === c.dir) score += 15; else return 0;                 // opposite directional = different road
+  } else if (!inp.dir && !c.dir) {
+    score += 5;
+  }
+  const coreHit = c.core.length ? c.core.filter((t) => inp.tokens.includes(t)).length / c.core.length : 0;
+  if (coreHit === 0) return 0;                                          // wrong street name entirely
+  score += Math.round(coreHit * 20);
+  const extra = c.core.filter((t) => !inp.tokens.includes(t)).length;  // e.g. "POINTE" not in submitted addr
+  score -= extra * 15;
+  if (inp.suffix && c.suffix) score += inp.suffix === c.suffix ? 10 : -20;    // RD vs LN
+  if (cand.city && inp.tokens.includes(normToken(cand.city))) score += 15;    // city corroboration
+  if (ownerHint && cand.owner) {
+    const surs = normToken(ownerHint).split(" ").filter((t) => t.length > 2);
+    if (surs.some((s) => normToken(cand.owner).includes(s))) score += 20;     // owner surname corroboration
+  }
+  return Math.max(0, score);
+}
+
+// Rank Land Portal features against the submitted address; returns sorted list.
+function rankCandidates(inputAddress, features, ownerHint) {
+  const inp = parseStreet(inputAddress);
+  return (features || [])
+    .map((f) => ({
+      f, p: f?.properties || {},
+      score: scoreCandidate(inp, {
+        street: f?.properties?.street_address ?? f?.properties?.address,
+        city: f?.properties?.city,
+        owner: f?.properties?.owner_full_name ?? f?.properties?.owner,
+      }, ownerHint),
+    }))
+    .sort((a, b) => b.score - a.score);
+}
+
 /**
  * Resolve a parcel from any input.
- * Returns { property (normalized | null), matchType, geo, raw }.
+ * Returns { property (normalized | null), matchType, geo, candidates?, confidence? }.
+ * For addresses it runs a cascade: strongly-corroborated address search →
+ * geocode+point → moderately-confident address search → owner-name last resort.
  */
-async function resolveParcel({ apn, address, propertyId, lat, lng, state = "TN" }) {
+async function resolveParcel({ apn, address, propertyId, lat, lng, state = "TN", ownerHint = null }) {
   // Direct property_id
   if (propertyId) {
     const detail = await getPropertyDetail(propertyId);
@@ -304,8 +392,7 @@ async function resolveParcel({ apn, address, propertyId, lat, lng, state = "TN" 
     return { property: null, matchType: "apn", geo: null };
   }
 
-  // Address → geocode → point lookup (v2 text address search is unreliable, so
-  // resolve the address to coordinates first, then ask Land Portal what's there).
+  // Address → multi-strategy cascade.
   if (address) {
     if (looksLikeApn(address)) {
       const r = await resolveParcel({ apn: address, state });
@@ -314,15 +401,61 @@ async function resolveParcel({ apn, address, propertyId, lat, lng, state = "TN" 
     const parts = address.replace(/,/g, " ").trim().split(/\s+/);
     const zip = /^\d{5}$/.test(parts[parts.length - 1]) ? parts[parts.length - 1] : "";
     const geo = await geocodeAddress(address, "", state, zip);
+
+    // Native address search, scored. This is the most reliable strategy for
+    // free-typed addresses — the geocoded street point routinely falls just
+    // outside the parcel polygon, so a point-only lookup misses valid parcels.
+    let ranked = [];
+    try {
+      const { features } = await searchProperties({ address, state });
+      ranked = rankCandidates(address, features, ownerHint);
+    } catch (e) {
+      console.error("Address search failed:", e.message);
+    }
+    const candidates = ranked.slice(0, 4).map((r) => ({ ...slimFeature(r.f), score: r.score }));
+    const top = ranked[0];
+
+    // Strategy 1: strongly-corroborated address match (number + street + city or
+    // owner) — trust it even over a point hit, which can land in a neighbor lot.
+    if (top && top.score >= 95 && top.p.property_id) {
+      const detail = await getPropertyDetail(top.p.property_id);
+      return { property: normalizeProperty(detail.property, top.p), matchType: "address_search", geo, candidates, confidence: top.score };
+    }
+
+    // Strategy 2: geocode → point lookup (authoritative when the point lands in a parcel).
     if (geo?.lat && geo?.lng) {
       const { feature } = await getPropertyByPoint(geo.lat, geo.lng);
       const match = feature?.properties;
       if (match?.property_id) {
         const detail = await getPropertyDetail(match.property_id);
-        return { property: normalizeProperty(detail.property, match), matchType: "address_point", geo };
+        return { property: normalizeProperty(detail.property, match), matchType: "address_point", geo, candidates };
       }
     }
-    return { property: null, matchType: "address", geo };
+
+    // Strategy 3: moderately-confident address match.
+    if (top && top.score >= 80 && top.p.property_id) {
+      const detail = await getPropertyDetail(top.p.property_id);
+      return { property: normalizeProperty(detail.property, top.p), matchType: "address_search", geo, candidates, confidence: top.score };
+    }
+
+    // Strategy 4: owner-name last resort — only accept if the owner's parcel also
+    // corroborates on the submitted address (score >= 95), so we never attach a
+    // random same-surname parcel elsewhere in the state.
+    if (ownerHint) {
+      try {
+        const { features } = await searchProperties({ owner: ownerHint, state });
+        const ob = rankCandidates(address, features, ownerHint)[0];
+        if (ob && ob.score >= 95 && ob.p.property_id) {
+          const detail = await getPropertyDetail(ob.p.property_id);
+          return { property: normalizeProperty(detail.property, ob.p), matchType: "owner_search", geo, candidates, confidence: ob.score };
+        }
+      } catch (e) {
+        console.error("Owner search failed:", e.message);
+      }
+    }
+
+    // No confident match — return the closest candidates so the note can suggest them.
+    return { property: null, matchType: "address", geo, candidates };
   }
 
   return { property: null, matchType: "none", geo: null };
@@ -361,7 +494,18 @@ function compsSummary(comps) {
 function buildStructuredNote(p, ctx = {}) {
   const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "2-digit", day: "2-digit" });
   if (!p) {
-    return `PARCEL ANALYSIS - Auto-generated ${today}\n\nNo parcel match found for: ${ctx.inputLabel || "unknown input"}\n\n${ctx.errorMsg ? `[note: ${ctx.errorMsg}]` : "Verify the APN/address and try again."}`;
+    let msg = `PARCEL ANALYSIS - Auto-generated ${today}\n\nNo confident parcel match for: ${ctx.inputLabel || "unknown input"}`;
+    const cands = (ctx.candidates || []).filter((c) => c.property_id);
+    if (cands.length) {
+      msg += `\n\nClosest Land Portal candidates (VERIFY before using):\n`;
+      msg += cands.map((c, i) =>
+        `  ${i + 1}. ${c.street || "?"}, ${c.city || "?"}${c.county ? ` (${c.county} Co)` : ""} — ${c.owner || "owner ?"}; ${c.acres != null ? `${c.acres} ac` : "? ac"}; APN ${c.apn || "?"}  [match ${c.score}]`
+      ).join("\n");
+      msg += `\n\nIf #1 is correct, re-run analysis with its APN for the full parcel report.`;
+    } else {
+      msg += `\n\n${ctx.errorMsg ? `[note: ${ctx.errorMsg}]` : "Verify the APN/address and try again."}`;
+    }
+    return msg;
   }
 
   const absentee = isAbsentee(p);
@@ -490,17 +634,23 @@ async function handleManualLookup(req, res) {
     });
   }
 
+  const owner = q.owner || null;
   const inputLabel = apn || address || propertyId || `${lat},${lng}`;
-  const { property, matchType, geo } = await resolveParcel({ apn, address, propertyId, lat, lng, state });
+  const { property, matchType, geo, candidates, confidence } = await resolveParcel({
+    apn, address, propertyId, lat, lng, state, ownerHint: owner,
+  });
 
   const note = await synthesizeParcelNote(property, {
     inputLabel,
     geoAddress: geo?.matchedAddress,
     leadContext: `Manual lookup for ${inputLabel}`,
+    candidates,
   });
 
+  // Post when a contact is attached and we have something useful — a resolved
+  // parcel OR ranked candidates to verify (so a near-miss still leaves a breadcrumb).
   let notePosted = false;
-  if (contactId && property) {
+  if (contactId && (property || (candidates && candidates.some((c) => c.property_id)))) {
     await ghlAddNote(contactId, note);
     notePosted = true;
   }
@@ -509,7 +659,9 @@ async function handleManualLookup(req, res) {
     success: !!property,
     matchType,
     parcelFound: !!property,
+    confidence: confidence ?? null,
     property,
+    candidates: candidates || [],
     note,
     notePosted,
   });
@@ -590,6 +742,7 @@ export default async function handler(req, res) {
         apn: looksLikeApn(lead.propertyAddress) ? lead.propertyAddress : undefined,
         address: looksLikeApn(lead.propertyAddress) ? undefined : lead.propertyAddress,
         state: "TN",
+        ownerHint: contactName || null,   // corroborate/disambiguate by lead's name
       });
       property = resolved.property;
 
@@ -597,6 +750,7 @@ export default async function handler(req, res) {
         inputLabel: lead.propertyAddress,
         geoAddress: resolved.geo?.matchedAddress,
         leadContext: `${contactName} — reason: ${lead.reason || "n/a"}; submitted: ${lead.propertyAddress}`,
+        candidates: resolved.candidates,
       });
       await ghlAddNote(lead.contactId, note);
     } else if (classification.type === "unclassified" || classification.flags?.includes("needs-manual-review")) {
