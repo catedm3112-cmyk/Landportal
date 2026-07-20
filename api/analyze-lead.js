@@ -29,9 +29,11 @@ const GHL_BASE = "https://services.leadconnectorhq.com";
 const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
 const LOCATION_ID = "EHl75N7YlN7nOMP30CYm";
 
-// User IDs
+// User IDs. NOTE: the old Dillon user xl8mtehpGgd8hQuVXGVk was DELETED during the
+// account consolidation — assigning to it silently orphans the lead. Use the
+// current consolidated Dillon user vEkFZMkHecUPXltiehzW.
 const USERS = {
-  dillon: "xl8mtehpGgd8hQuVXGVk",
+  dillon: "vEkFZMkHecUPXltiehzW",
   chris: "hCiuXELpRegkI5QKa7si",
 };
 
@@ -229,6 +231,49 @@ async function ghlAddNote(contactId, body) {
     body: JSON.stringify({ body }),
   });
   return res.json();
+}
+
+// Patch an existing opportunity (used to write the parcel value into the deal so
+// the pipeline/forecast stops showing $0).
+async function ghlUpdateOpportunity(opportunityId, fields) {
+  const res = await fetch(`${GHL_BASE}/opportunities/${opportunityId}`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${GHL_API_KEY}`,
+      "Content-Type": "application/json",
+      Version: "2021-07-28",
+    },
+    body: JSON.stringify(fields),
+  });
+  return res.json();
+}
+
+// Create a follow-up task so a new lead lands in someone's work queue instead of
+// sitting untouched in "New Lead". Due tomorrow, assigned to the lead's owner.
+async function ghlCreateTask(contactId, title, body, assignedTo) {
+  const dueDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const res = await fetch(`${GHL_BASE}/contacts/${contactId}/tasks`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${GHL_API_KEY}`,
+      "Content-Type": "application/json",
+      Version: "2021-07-28",
+    },
+    body: JSON.stringify({ title, body, dueDate, completed: false, assignedTo }),
+  });
+  return res.json();
+}
+
+// Pull an opportunity id out of the create-opportunity response (shape varies).
+function oppId(result) {
+  return result?.opportunity?.id || result?.id || null;
+}
+
+// Best "deal value" we can infer for a resolved parcel — Land Portal's land
+// estimate first (most on-brand for a land business), then market/assessed value.
+function parcelValue(p) {
+  const v = p?.tlpEstimate ?? p?.marketTotalValue ?? p?.assessedTotalValue ?? null;
+  return typeof v === "number" && v > 0 ? Math.round(v) : null;
 }
 
 // ─── PARCEL RESOLUTION (Land Portal v2) ────────────────────────────────────────
@@ -733,6 +778,24 @@ export default async function handler(req, res) {
     }
     console.log("Opportunity:", JSON.stringify(opportunityResult));
 
+    // ── STEP 3b: Follow-up task ──────────────────────────────────────────────
+    // Every opportunity gets a same-day call task so leads never sit unworked.
+    let taskCreated = false;
+    const newOppId = oppId(opportunityResult);
+    if (newOppId) {
+      const label = classification.type === "buyer-investor" ? "buyer/investor" : "seller";
+      await ghlCreateTask(
+        lead.contactId,
+        `📞 Call ${contactName} — new ${label} lead`,
+        `New ${classification.type} lead (${lead.source || "unknown source"}). ` +
+          `${lead.propertyAddress ? `Property: ${lead.propertyAddress}. ` : ""}` +
+          `Reason: ${lead.reason || "n/a"}. Speed-to-lead — reach out today.`,
+        assignedTo
+      );
+      taskCreated = true;
+      console.log("Task created for", newOppId);
+    }
+
     // ── STEP 4: Parcel analysis (seller leads only) ──────────────────────────
     let property = null;
     let note = null;
@@ -745,6 +808,14 @@ export default async function handler(req, res) {
         ownerHint: contactName || null,   // corroborate/disambiguate by lead's name
       });
       property = resolved.property;
+
+      // Write the parcel's value onto the opportunity so the pipeline/forecast
+      // reflects real dollars instead of $0.
+      const value = parcelValue(property);
+      if (newOppId && value) {
+        await ghlUpdateOpportunity(newOppId, { monetaryValue: value });
+        console.log("Opportunity value set:", value);
+      }
 
       note = await synthesizeParcelNote(property, {
         inputLabel: lead.propertyAddress,
@@ -768,6 +839,8 @@ export default async function handler(req, res) {
       tagsApplied: tags,
       assignedTo,
       opportunityCreated: !!opportunityResult,
+      opportunityValue: parcelValue(property),
+      taskCreated,
       parcelFound: !!property,
       notePosted: !!note,
     });
