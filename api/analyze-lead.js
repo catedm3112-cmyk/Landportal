@@ -234,16 +234,32 @@ async function ghlAddNote(contactId, body) {
 // ─── PARCEL RESOLUTION (Land Portal v2) ────────────────────────────────────────
 
 async function geocodeAddress(street, city, state, zip) {
+  const pick = (j) => {
+    const m = j?.result?.addressMatches?.[0];
+    return m ? { lat: m.coordinates.y, lng: m.coordinates.x, matchedAddress: m.matchedAddress } : null;
+  };
+
+  // Try the one-line geocoder first — it handles free-typed addresses like
+  // "7331 East Emory Rd Corryton TN" far better than the component endpoint,
+  // which needs the town split out of the street and otherwise returns 0.
+  const oneline = [street, city, state, zip].filter(Boolean).join(" ").trim();
+  if (oneline) {
+    try {
+      const p = new URLSearchParams({ address: oneline, benchmark: "2020", format: "json" });
+      const r = await fetch(`https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?${p}`);
+      const hit = pick(await r.json().catch(() => null));
+      if (hit) return hit;
+    } catch { /* fall through to component endpoint */ }
+  }
+
+  // Fallback: component endpoint (works when street/city are cleanly split).
   const params = new URLSearchParams({ benchmark: "2020", format: "json" });
   if (street) params.set("street", street);
   if (city) params.set("city", city);
   if (state) params.set("state", state);
   if (zip) params.set("zip", zip);
   const res = await fetch(`https://geocoding.geo.census.gov/geocoder/locations/address?${params}`);
-  const json = await res.json().catch(() => null);
-  const match = json?.result?.addressMatches?.[0];
-  if (!match) return null;
-  return { lat: match.coordinates.y, lng: match.coordinates.x, matchedAddress: match.matchedAddress };
+  return pick(await res.json().catch(() => null));
 }
 
 // An APN tends to be a short token of digits/dashes/dots with no street words.
