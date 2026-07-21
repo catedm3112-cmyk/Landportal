@@ -7,7 +7,10 @@ name: Pulse — lead accountability sweep
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+    # Requested every 5 min — GitHub throttles scheduled runs on quiet public
+    # repos (observed: */15 fired only every 1.5-3.5h), so ask more often to get
+    # an effective ~15-30 min cadence. Pulse is idempotent; extra runs are free.
+    - cron: "*/5 * * * *"
   workflow_dispatch:          # allow manual runs from the Actions tab
 
 jobs:
