@@ -630,7 +630,7 @@ ${JSON.stringify(p, null, 2)}`;
       prompt,
       maxTokens: 3500,
       thinking: true,
-      effort: "high",
+      effort: "medium", // Opus 4.8 medium stays well under the 60s function limit while keeping the deep read
     });
     // Strip any echoed "ANALYST NOTES:" label(s) so the header isn't duplicated.
     if (analyst) analyst = analyst.replace(/^\s*(analyst notes\s*:?\s*)+/i, "").trim();
