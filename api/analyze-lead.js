@@ -28,6 +28,37 @@ const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_BASE = "https://services.leadconnectorhq.com";
 const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY;
 const LOCATION_ID = "EHl75N7YlN7nOMP30CYm";
+const CLAUDE_API = "https://api.anthropic.com/v1/messages";
+
+// Model routing: cheap+fast for classification, top-tier for the land analysis
+// that actually drives decisions, mid-tier for outreach copy.
+const MODELS = {
+  classify: "claude-haiku-4-5-20251001",
+  analyst: "claude-opus-4-8",
+  draft: "claude-sonnet-5",
+};
+
+// One Claude call over raw HTTP. Returns the assistant's text. IMPORTANT: with a
+// thinking model, content[0] is a thinking block (empty text by default) and the
+// answer is a later text block — so find the text block, never index [0].
+async function callClaude({ model, prompt, maxTokens = 1024, thinking = false, effort = null }) {
+  if (!CLAUDE_API_KEY) throw new Error("No Claude API key");
+  const body = { model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] };
+  if (thinking) body.thinking = { type: "adaptive" };
+  if (effort) body.output_config = { effort };
+  const res = await fetch(CLAUDE_API, {
+    method: "POST",
+    headers: {
+      "x-api-key": CLAUDE_API_KEY.trim(),
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json();
+  if (json.error) throw new Error(`Anthropic ${res.status}: ${json.error?.message || "unknown"}`);
+  return ((json.content || []).find((b) => b.type === "text")?.text || "").trim();
+}
 
 // User IDs. NOTE: the old Dillon user xl8mtehpGgd8hQuVXGVk was DELETED during the
 // account consolidation — assigning to it silently orphans the lead. Use the
@@ -146,26 +177,7 @@ For flags, include any of: "no-property-address", "no-email", "no-phone", "out-o
 Set confidence to "low" if you are uncertain. Never assume type from pipeline placement alone.`;
 
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": CLAUDE_API_KEY.trim(),
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 512,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    const json = await res.json();
-    if (json.error) {
-      console.error("Anthropic API error:", res.status, JSON.stringify(json.error));
-      throw new Error(`Anthropic API ${res.status}: ${json.error?.message || "unknown"}`);
-    }
-    const text = json.content?.[0]?.text?.trim();
+    const text = await callClaude({ model: MODELS.classify, prompt, maxTokens: 512 });
     if (!text) throw new Error("No classifier response");
 
     const classification = extractJson(text);
@@ -596,9 +608,16 @@ async function synthesizeParcelNote(p, ctx = {}) {
     return buildStructuredNote(p, { ...ctx, errorMsg: !CLAUDE_API_KEY ? "No Claude API key" : ctx.errorMsg });
   }
 
-  const prompt = `You are a land acquisition analyst for TruTerra Group in Sevier County, Tennessee.
-Write 3-5 sentences assessing the parcel below — opportunity size, buildability/slope reality, flood/water/access constraints, absentee-owner angle, and a recommended next action. Be direct and specific. Output only the prose: no heading, no label, no markdown.
-Note: tax_amount may be reported in cents — do not flag it as inconsistent unless clearly material.
+  const prompt = `You are a senior land-acquisition analyst for The TruTerra Group in Sevier County, Tennessee. TruTerra buys, brokers, and develops land and partners with its sister builder TruBuilt.
+
+Write a tight, decision-useful read on the parcel below for the acquisitions team — what you'd tell a partner before they call the owner. Cover, only where the data supports it:
+- Opportunity thesis: what makes this worth (or not worth) pursuing, and rough deal size.
+- Buildability reality: slope, buildable acreage, and what it realistically supports (single build, subdivide, STR, hold).
+- Constraints: flood/FEMA, wetlands, water, road frontage / access / land-locked, zoning.
+- Owner angle: absentee vs local, likely motivation given the lead's stated reason, and how to open the conversation.
+- Recommended next action: one concrete move (e.g. "offer a free valuation and ask their timeline", "verify septic feasibility with Sevier County", "pass — land-locked, low buildable").
+
+Be direct and specific; use the numbers. If a data point is missing or looks off, say so briefly instead of guessing. Plain prose only — no headings, no bullet labels, no markdown. Note: tax_amount may be reported in cents; don't flag it as inconsistent unless clearly material.
 
 LEAD CONTEXT: ${ctx.leadContext || "Manual / ad-hoc lookup (no lead attached)"}
 
@@ -606,27 +625,46 @@ PARCEL DATA:
 ${JSON.stringify(p, null, 2)}`;
 
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": CLAUDE_API_KEY.trim(),
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 600,
-        messages: [{ role: "user", content: prompt }],
-      }),
+    let analyst = await callClaude({
+      model: MODELS.analyst,
+      prompt,
+      maxTokens: 3500,
+      thinking: true,
+      effort: "high",
     });
-    const json = await res.json();
-    let analyst = json.content?.[0]?.text?.trim();
     // Strip any echoed "ANALYST NOTES:" label(s) so the header isn't duplicated.
     if (analyst) analyst = analyst.replace(/^\s*(analyst notes\s*:?\s*)+/i, "").trim();
-    return buildStructuredNote(p, { ...ctx, analyst: analyst || null, errorMsg: analyst ? null : json.error?.message });
+    return buildStructuredNote(p, { ...ctx, analyst: analyst || null, errorMsg: analyst ? null : "empty analysis" });
   } catch (err) {
     return buildStructuredNote(p, { ...ctx, errorMsg: err.message });
   }
+}
+
+// ─── FIRST-TOUCH DRAFT (never auto-sent) ──────────────────────────────────────
+// Draft the first SMS + email for the rep to review and send manually. TruTerra
+// operating rule: Claude drafts outbound, a human sends it.
+async function draftFirstTouch({ lead, parcel, analystNote, repName }) {
+  const acres = parcel?.lotSizeAcres != null ? `${parcel.lotSizeAcres} ac` : "unknown acreage";
+  const county = parcel?.situsCounty || "Sevier";
+  const absentee = isAbsentee(parcel);
+  const prompt = `You are drafting the FIRST outreach from The TruTerra Group (a land buyer/broker in Sevier County, Tennessee) to a landowner who just inquired. Draft two short messages a human rep will review and send manually.
+
+Return ONLY valid JSON, no other text:
+{"sms": "...", "email_subject": "...", "email_body": "..."}
+
+Rules:
+- Warm and human, no hard sell — you're following up because they reached out.
+- SMS: 300 characters max, use the first name, plain text, end with an easy yes/no question. Do NOT add an opt-out footer.
+- Email: 3-5 sentences, subject 60 characters max.
+- Reference their property/situation naturally only if known. NEVER invent specifics — no prices, offers, valuations, or guarantees.
+- Sign as "${repName}, TruTerra Group" and include the callback number 865-505-7782.
+
+LEAD: first name "${lead.firstName || "there"}", reason for inquiry: ${lead.reason || "n/a"}, submitted property: ${lead.propertyAddress || "n/a"}
+PARCEL: ${acres}, ${county} County, ${absentee == null ? "owner locality unknown" : absentee ? "absentee owner" : "local owner"}
+ANALYST READ (context only — do not quote figures the owner didn't give you): ${(analystNote || "").slice(0, 900)}`;
+
+  const text = await callClaude({ model: MODELS.draft, prompt, maxTokens: 800 });
+  try { return extractJson(text); } catch { return null; }
 }
 
 // ─── PARSE GHL WEBHOOK ───────────────────────────────────────────────────────
@@ -802,6 +840,7 @@ export default async function handler(req, res) {
     // ── STEP 4: Parcel analysis (seller leads only) ──────────────────────────
     let property = null;
     let note = null;
+    let firstTouchDrafted = false;
 
     if (classification.run_parcel_analysis && lead.propertyAddress) {
       const resolved = await resolveParcel({
@@ -827,6 +866,27 @@ export default async function handler(req, res) {
         candidates: resolved.candidates,
       });
       await ghlAddNote(lead.contactId, note);
+
+      // Draft the first-touch text + email for the rep to review and send — never
+      // auto-sent (TruTerra rule: Claude drafts outbound, a human sends it).
+      if (property) {
+        try {
+          const repName = assignedTo === USERS.dillon ? "Dillon" : "Chris";
+          const draft = await draftFirstTouch({ lead, parcel: property, analystNote: note, repName });
+          if (draft && (draft.sms || draft.email_body)) {
+            await ghlCreateTask(
+              lead.contactId,
+              `✍️ Review & send first-touch to ${contactName}`,
+              `DRAFT — approve and send manually (NOT auto-sent).\n\n— TEXT —\n${draft.sms || "(none)"}\n\n— EMAIL —\nSubject: ${draft.email_subject || ""}\n\n${draft.email_body || "(none)"}`,
+              assignedTo
+            );
+            firstTouchDrafted = true;
+            console.log("First-touch draft task created");
+          }
+        } catch (e) {
+          console.error("First-touch draft failed:", e.message);
+        }
+      }
     } else if (classification.type === "unclassified" || classification.flags?.includes("needs-manual-review")) {
       await ghlAddNote(
         lead.contactId,
@@ -846,6 +906,7 @@ export default async function handler(req, res) {
       taskCreated,
       parcelFound: !!property,
       notePosted: !!note,
+      firstTouchDrafted,
     });
   } catch (err) {
     console.error("Handler error:", err);
