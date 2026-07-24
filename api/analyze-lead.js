@@ -643,28 +643,68 @@ ${JSON.stringify(p, null, 2)}`;
 // ─── FIRST-TOUCH DRAFT (never auto-sent) ──────────────────────────────────────
 // Draft the first SMS + email for the rep to review and send manually. TruTerra
 // operating rule: Claude drafts outbound, a human sends it.
-async function draftFirstTouch({ lead, parcel, analystNote, repName }) {
+async function draftFirstTouch({ lead, parcel, analystNote, repName, cold = false }) {
   const acres = parcel?.lotSizeAcres != null ? `${parcel.lotSizeAcres} ac` : "unknown acreage";
   const county = parcel?.situsCounty || "Sevier";
   const absentee = isAbsentee(parcel);
-  const prompt = `You are drafting the FIRST outreach from The TruTerra Group (a land buyer/broker in Sevier County, Tennessee) to a landowner who just inquired. Draft two short messages a human rep will review and send manually.
+  const intro = cold
+    ? `You are drafting a COLD first outreach from The TruTerra Group (a local land buyer/broker in Sevier County, Tennessee) to a landowner who has NOT contacted us. Be respectful and low-pressure: briefly say why you're reaching out (you work with landowners in their area), offer a free, no-obligation valuation, and make it easy to say no.`
+    : `You are drafting the FIRST outreach from The TruTerra Group (a land buyer/broker in Sevier County, Tennessee) to a landowner who just inquired. Warm and human, no hard sell — you're following up because they reached out.`;
+  const prompt = `${intro}
+
+Draft two short messages a human rep will review and send manually.
 
 Return ONLY valid JSON, no other text:
 {"sms": "...", "email_subject": "...", "email_body": "..."}
 
 Rules:
-- Warm and human, no hard sell — you're following up because they reached out.
-- SMS: 300 characters max, use the first name, plain text, end with an easy yes/no question. Do NOT add an opt-out footer.
+- SMS: 300 characters max, use the first name if known, plain text, end with an easy yes/no question. Do NOT add an opt-out footer.
 - Email: 3-5 sentences, subject 60 characters max.
 - Reference their property/situation naturally only if known. NEVER invent specifics — no prices, offers, valuations, or guarantees.
 - Sign as "${repName}, TruTerra Group" and include the callback number 865-505-7782.
 
-LEAD: first name "${lead.firstName || "there"}", reason for inquiry: ${lead.reason || "n/a"}, submitted property: ${lead.propertyAddress || "n/a"}
-PARCEL: ${acres}, ${county} County, ${absentee == null ? "owner locality unknown" : absentee ? "absentee owner" : "local owner"}
-ANALYST READ (context only — do not quote figures the owner didn't give you): ${(analystNote || "").slice(0, 900)}`;
+LEAD: first name "${lead.firstName || "there"}", ${cold ? "" : `reason for inquiry: ${lead.reason || "n/a"}, `}property: ${lead.propertyAddress || "n/a"}
+PARCEL: ${acres}, ${county} County, ${absentee == null ? "owner locality unknown" : absentee ? "absentee owner" : "local owner"}${analystNote ? `\nANALYST READ (context only — do not quote figures the owner didn't give you): ${(analystNote || "").slice(0, 900)}` : ""}`;
 
   const text = await callClaude({ model: MODELS.draft, prompt, maxTokens: 800 });
   try { return extractJson(text); } catch { return null; }
+}
+
+// ─── OUTBOUND MODE: personalized cold-outreach draft (draft-only) ──────────────
+// POST /api/analyze-lead?mode=outreach — for a known landowner (cold list), pull
+// their parcel and draft a personalized first-touch into a review task. No intake
+// pipeline (no classify/opportunity). Outbound stays draft-only.
+async function handleOutreachDraft(res, lead) {
+  if (!lead.propertyAddress) {
+    return res.status(200).json({ success: false, mode: "outreach", reason: "no property address on contact" });
+  }
+  const contactName = `${lead.firstName} ${lead.lastName}`.trim();
+  const resolved = await resolveParcel({
+    apn: looksLikeApn(lead.propertyAddress) ? lead.propertyAddress : undefined,
+    address: looksLikeApn(lead.propertyAddress) ? undefined : lead.propertyAddress,
+    state: "TN",
+    ownerHint: contactName || null,
+  });
+  const property = resolved.property;
+  const assignedTo = roundRobin(lead.contactId);
+  const repName = assignedTo === USERS.dillon ? "Dillon" : "Chris";
+
+  let drafted = false;
+  const draft = await draftFirstTouch({ lead, parcel: property, analystNote: null, repName, cold: true });
+  if (draft && (draft.sms || draft.email_body)) {
+    await ghlAddTags(lead.contactId, ["outreach:drafted"]);
+    await ghlCreateTask(
+      lead.contactId,
+      `✍️ Review & send cold outreach to ${contactName || lead.propertyAddress}`,
+      `DRAFT cold outreach — approve and send manually (NOT auto-sent).\n\n— TEXT —\n${draft.sms || "(none)"}\n\n— EMAIL —\nSubject: ${draft.email_subject || ""}\n\n${draft.email_body || "(none)"}`,
+      assignedTo
+    );
+    drafted = true;
+  }
+  return res.status(200).json({
+    success: true, mode: "outreach", contactId: lead.contactId,
+    parcelFound: !!property, outreachDrafted: drafted, assignedTo,
+  });
 }
 
 // ─── PARSE GHL WEBHOOK ───────────────────────────────────────────────────────
@@ -769,12 +809,25 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // Webhook auth: once WEBHOOK_SECRET is set in the environment, require a matching
+  // x-webhook-secret header on POST. Until it's set, allow (so the check can ship
+  // before the GHL header is added). GET (manual lookup) is exempt.
+  const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+  if (WEBHOOK_SECRET && (req.headers["x-webhook-secret"] || "") !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
   try {
     const payload = req.body;
     const lead = parseGHLWebhook(payload);
     console.log("Lead:", JSON.stringify(lead));
 
     if (!lead.contactId) return res.status(400).json({ error: "No contact ID" });
+
+    // Outbound mode: personalized cold-outreach draft only (skips the intake pipeline).
+    if ((req.query?.mode || payload?.mode) === "outreach") {
+      return await handleOutreachDraft(res, lead);
+    }
 
     // ── STEP 1: Classify ────────────────────────────────────────────────────
     const classification = await classifyLead({
