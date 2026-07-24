@@ -597,7 +597,8 @@ async function synthesizeParcelNote(p, ctx = {}) {
   }
 
   const prompt = `You are a land acquisition analyst for TruTerra Group in Sevier County, Tennessee.
-Write 3-5 sentences of ANALYST NOTES for the parcel below — opportunity size, buildability/slope reality, flood/water/access constraints, absentee-owner angle, and a recommended next action. Be direct and specific. Plain text only, no markdown.
+Write 3-5 sentences assessing the parcel below — opportunity size, buildability/slope reality, flood/water/access constraints, absentee-owner angle, and a recommended next action. Be direct and specific. Output only the prose: no heading, no label, no markdown.
+Note: tax_amount may be reported in cents — do not flag it as inconsistent unless clearly material.
 
 LEAD CONTEXT: ${ctx.leadContext || "Manual / ad-hoc lookup (no lead attached)"}
 
@@ -619,7 +620,9 @@ ${JSON.stringify(p, null, 2)}`;
       }),
     });
     const json = await res.json();
-    const analyst = json.content?.[0]?.text?.trim();
+    let analyst = json.content?.[0]?.text?.trim();
+    // Strip any echoed "ANALYST NOTES:" label(s) so the header isn't duplicated.
+    if (analyst) analyst = analyst.replace(/^\s*(analyst notes\s*:?\s*)+/i, "").trim();
     return buildStructuredNote(p, { ...ctx, analyst: analyst || null, errorMsg: analyst ? null : json.error?.message });
   } catch (err) {
     return buildStructuredNote(p, { ...ctx, errorMsg: err.message });
