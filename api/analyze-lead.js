@@ -548,6 +548,20 @@ function compsSummary(comps) {
     .join("; ");
 }
 
+// Handy, accurate links for the rep: a one-tap satellite view at the parcel's
+// exact coordinates (works on any device, no login) + the official TN parcel/
+// assessment viewer. Falls back to an address search when no parcel resolved.
+function mapLinks(p, ctx = {}) {
+  const out = [];
+  if (p?.latitude != null && p?.longitude != null) {
+    out.push(`Map (satellite): https://www.google.com/maps/search/?api=1&query=${p.latitude},${p.longitude}`);
+  } else if (ctx.geoAddress || ctx.inputLabel) {
+    out.push(`Map: https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(ctx.geoAddress || ctx.inputLabel)}`);
+  }
+  out.push(`TN parcel records: https://tnmap.tn.gov/assessment/  (${p?.situsCounty || "Sevier"} Co${p?.apn ? `, search APN ${p.apn}` : ""})`);
+  return out;
+}
+
 function buildStructuredNote(p, ctx = {}) {
   const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "2-digit", day: "2-digit" });
   if (!p) {
@@ -562,6 +576,7 @@ function buildStructuredNote(p, ctx = {}) {
     } else {
       msg += `\n\n${ctx.errorMsg ? `[note: ${ctx.errorMsg}]` : "Verify the APN/address and try again."}`;
     }
+    msg += `\n\nLINKS\n  ${mapLinks(null, ctx).join("\n  ")}`;
     return msg;
   }
 
@@ -578,6 +593,9 @@ OWNER OF RECORD: ${p.ownerName || "Unknown"}
 ACREAGE: ${p.lotSizeAcres != null ? `${p.lotSizeAcres} ac` : "Unknown"}
 LAND USE: ${p.landUseDescription || p.landUseCode || "Unknown"}
 LEGAL: ${p.legalDescription || "Unknown"}
+
+LINKS
+  ${mapLinks(p, ctx).join("\n  ")}
 
 VALUE
   Assessed (total): ${fmtMoney(p.assessedTotalValue)}
