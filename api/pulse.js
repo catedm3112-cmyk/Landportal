@@ -46,6 +46,15 @@ const CLOSED_STATUSES = new Set(["won", "lost", "abandoned"]);
 // tasks, never a task a human made.
 const PULSE_MARK = "[auto:pulse]";
 
+// Contact-level marker that we've already raised a nudge for the current
+// needs-us episode. It lives on the CONTACT, not the task, so it survives the
+// rep completing OR deleting the task (a task record does not) — that's what
+// stops a dismissed nudge from being recreated on the next 5-minute sweep. It is
+// lifted when the episode actually resolves: the rep replies (ball back in their
+// court) or the opp is parked/closed. So a genuinely new needs-us moment can
+// still nudge again later; only the one the rep already dismissed stays gone.
+const NUDGED_TAG = "pulse:nudged";
+
 // How long an inbound message can sit unanswered before it's "needs us" (ms).
 const REPLY_GRACE_MS = 30 * 60 * 1000;      // 30 min
 // How long a brand-new lead can sit with no outbound before it's "needs us" (ms).
@@ -116,6 +125,14 @@ async function completeTask(contactId, taskId) {
   });
 }
 
+async function addTag(contactId, tag) {
+  return ghl(`/contacts/${contactId}/tags`, { method: "POST", body: JSON.stringify({ tags: [tag] }) });
+}
+
+async function removeTag(contactId, tag) {
+  return ghl(`/contacts/${contactId}/tags`, { method: "DELETE", body: JSON.stringify({ tags: [tag] }) });
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function oppOwner(opp) {
   return opp.assignedTo && [USERS.dillon, USERS.chris].includes(opp.assignedTo)
@@ -130,6 +147,10 @@ function hasSkipTag(tags) {
 // Does this contact already have an OPEN task? (any human or pulse task → don't pile on)
 function openTasks(tasks) {
   return (tasks || []).filter((t) => !t.completed && t.status !== "completed");
+}
+
+function hasTag(tags, name) {
+  return (tags || []).some((t) => String(t).toLowerCase() === name.toLowerCase());
 }
 
 // ─── SWEEP ───────────────────────────────────────────────────────────────────
@@ -173,6 +194,8 @@ export default async function handler(req, res) {
               digest.cleared.push({ name, task: t.title });
             }
           }
+          // Episode over — lift suppression so a future active cycle can nudge again.
+          if (hasTag(tags, NUDGED_TAG)) await removeTag(contactId, NUDGED_TAG);
         } else {
           digest.cleared.push({ name, note: "would clear auto tasks (parked/done)" });
         }
@@ -197,13 +220,34 @@ export default async function handler(req, res) {
         reason = "new lead — not yet contacted";
       }
 
-      if (!reason) { digest.inMotion.push({ name, stage }); continue; }
-
-      // Idempotent: if they already have ANY open task, don't add another.
-      const tasks = dry ? [] : await getContactTasks(contactId);
-      if (!dry && openTasks(tasks).length) {
-        digest.skipped.push({ name, reason: "already has an open task" });
+      if (!reason) {
+        // Ball's back in their court — episode resolved. Lift suppression so a
+        // later unanswered inbound can nudge again.
+        if (!dry && hasTag(tags, NUDGED_TAG)) await removeTag(contactId, NUDGED_TAG);
+        digest.inMotion.push({ name, stage });
         continue;
+      }
+
+      // Already nudged this episode (the rep may have completed OR deleted the
+      // task) — don't resurrect it. Suppression lifts on reply or when parked.
+      if (hasTag(tags, NUDGED_TAG)) { digest.skipped.push({ name, reason: "already nudged this cycle" }); continue; }
+
+      // Idempotent: if they already have ANY open task, don't add another. And if
+      // a pulse task exists in ANY state (open, or already completed by the rep),
+      // mark the episode nudged so completing/deleting it won't bring it back.
+      const tasks = dry ? [] : await getContactTasks(contactId);
+      if (!dry) {
+        const pulseTaskExists = (tasks || []).some((t) => (t.body || "").includes(PULSE_MARK));
+        if (openTasks(tasks).length) {
+          if (pulseTaskExists) await addTag(contactId, NUDGED_TAG);
+          digest.skipped.push({ name, reason: "already has an open task" });
+          continue;
+        }
+        if (pulseTaskExists) {
+          await addTag(contactId, NUDGED_TAG);
+          digest.skipped.push({ name, reason: "already nudged (prior auto task cleared)" });
+          continue;
+        }
       }
 
       const owner = oppOwner(opp);
@@ -212,7 +256,10 @@ export default async function handler(req, res) {
         : `📞 Call ${name} — new lead, not yet contacted`;
       const body = `${name} ${reason}. ${conv?.lastMessageBody ? `Last msg: "${String(conv.lastMessageBody).slice(0, 140)}"` : ""}`.trim();
 
-      if (!dry) await createTask(contactId, title, body, owner);
+      if (!dry) {
+        await createTask(contactId, title, body, owner);
+        await addTag(contactId, NUDGED_TAG);
+      }
       digest.needsUs.push({ name, reason, owner: owner === USERS.chris ? "Chris" : "Dillon", title });
     }
 
@@ -229,15 +276,37 @@ export default async function handler(req, res) {
       if (hasSkipTag(conv.tags)) { digest.skipped.push({ name, reason: "spam/suppressed" }); continue; }
       const inbound = conv.lastMessageDirection === "inbound";
       const waiting = inbound && (conv.unreadCount > 0 || (conv.overdueAt && conv.overdueAt < now));
-      if (!waiting) continue;
+      if (!waiting) {
+        // Answered → episode resolved; lift any suppression for next time.
+        if (!dry && hasTag(conv.tags, NUDGED_TAG)) await removeTag(contactId, NUDGED_TAG);
+        continue;
+      }
+
+      // Already nudged (rep may have completed OR deleted the task) — don't resurrect.
+      if (hasTag(conv.tags, NUDGED_TAG)) { digest.skipped.push({ name, reason: "already nudged this cycle" }); continue; }
 
       const tasks = dry ? [] : await getContactTasks(contactId);
-      if (!dry && openTasks(tasks).length) { digest.skipped.push({ name, reason: "already has an open task" }); continue; }
+      if (!dry) {
+        const pulseTaskExists = (tasks || []).some((t) => (t.body || "").includes(PULSE_MARK));
+        if (openTasks(tasks).length) {
+          if (pulseTaskExists) await addTag(contactId, NUDGED_TAG);
+          digest.skipped.push({ name, reason: "already has an open task" });
+          continue;
+        }
+        if (pulseTaskExists) {
+          await addTag(contactId, NUDGED_TAG);
+          digest.skipped.push({ name, reason: "already nudged (prior auto task cleared)" });
+          continue;
+        }
+      }
 
       const owner = [USERS.dillon, USERS.chris].includes(conv.assignedTo) ? conv.assignedTo : USERS.chris;
       const title = `⏰ Reply to ${name} — waiting on us`;
       const body = `${name} messaged and it's unanswered.${conv.lastMessageBody ? ` Last: "${String(conv.lastMessageBody).slice(0, 140)}"` : ""}`;
-      if (!dry) await createTask(contactId, title, body, owner);
+      if (!dry) {
+        await createTask(contactId, title, body, owner);
+        await addTag(contactId, NUDGED_TAG);
+      }
       digest.needsUs.push({ name, reason: "waiting on our reply (no opp yet)", owner: owner === USERS.chris ? "Chris" : "Dillon", title });
     }
 

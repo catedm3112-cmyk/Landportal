@@ -12,6 +12,15 @@
     },
     "api/pulse.js": {
       "maxDuration": 60
+    },
+    "api/land-analysis.js": {
+      "maxDuration": 60
+    },
+    "api/report.js": {
+      "maxDuration": 15
+    },
+    "api/track.js": {
+      "maxDuration": 10
     }
   },
   "routes": [
@@ -38,6 +47,18 @@
     {
       "src": "/api/pulse",
       "dest": "/api/pulse.js"
+    },
+    {
+      "src": "/api/land-analysis",
+      "dest": "/api/land-analysis.js"
+    },
+    {
+      "src": "/api/track",
+      "dest": "/api/track.js"
+    },
+    {
+      "src": "/r/(?<slug>[^/]+)",
+      "dest": "/api/report?slug=$slug"
     }
   ],
   "crons": [
