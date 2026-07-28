@@ -12,6 +12,9 @@
     },
     "api/pulse.js": {
       "maxDuration": 60
+    },
+    "api/land-analysis.js": {
+      "maxDuration": 60
     }
   },
   "routes": [
@@ -38,6 +41,18 @@
     {
       "src": "/api/pulse",
       "dest": "/api/pulse.js"
+    },
+    {
+      "src": "/api/land-analysis",
+      "dest": "/api/land-analysis.js"
+    },
+    {
+      "src": "/api/track",
+      "dest": "/api/track.js"
+    },
+    {
+      "src": "/r/([^/]+)",
+      "dest": "/api/report.js?slug=$1"
     }
   ],
   "crons": [
