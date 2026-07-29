@@ -14,7 +14,7 @@
       "maxDuration": 60
     },
     "api/land-analysis.js": {
-      "maxDuration": 60
+      "maxDuration": 300
     }
   },
   "routes": [
