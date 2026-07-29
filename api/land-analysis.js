@@ -22,6 +22,7 @@ import {
   unconfirmedList,
 } from "../lib/parcel-intel.js";
 import { terrainIntel } from "../lib/terrain.js";
+import { soilIntel, soilSummary } from "../lib/soils.js";
 import {
   radarConfigured,
   resolveProperty,
@@ -326,7 +327,9 @@ export default async (req, res) => {
       county: countyName,
     });
 
-    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar, terrain });
+    const soil = await soilIntel(resolved.lat, resolved.lng);
+
+    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar, terrain, soil });
     const confirmed = confirmedOnly(facts);
     const unconfirmed = unconfirmedList(facts);
 
@@ -396,6 +399,9 @@ export default async (req, res) => {
           : `VACANT: no buildings in assessor record`,
         `Zoning: ${facts.zoning.confirmed ? `${facts.zoning.value} (confirmed — ${facts.zoning.source})` : `NOT CONFIRMED — verify with ${facts.zoning.verifyWith}`}`,
         `Utilities: water ${facts.water.value ?? "unconfirmed"} | sewer ${facts.sewer.value ?? "unconfirmed"} | electric ${facts.electric.value ?? "unconfirmed"}`,
+        facts.septicSuitability.confirmed
+          ? `SOIL/SEPTIC: ${soilSummary(soil)}`
+          : "",
         facts.sewerDistanceFeet.confirmed || facts.slopeAverage.confirmed
           ? `Terrain/utilities: ${facts.slopeAverage.confirmed ? `slope ${facts.slopeAverage.value}% avg grade (${facts.slopeDegreesMean.value}°), max ${facts.slopeMax.value}%` : "slope unconfirmed"}` +
             `${facts.sewerDistanceFeet.confirmed ? ` | nearest sewer manhole ${facts.sewerDistanceFeet.value} ft` : ""}` +

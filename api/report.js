@@ -179,6 +179,9 @@ ${f.slopeAverage?.confirmed ? `<div class="fact"><div class="k">Average Slope</d
 ${f.sewerDistanceFeet?.confirmed ? `<div class="fact"><div class="k">Nearest Sewer</div><div class="v">${esc(f.sewerDistanceFeet.value)} ft</div>${src(f.sewerDistanceFeet)}</div>` : ""}
 ${f.hydrantDistanceFeet?.confirmed ? `<div class="fact"><div class="k">Nearest Hydrant</div><div class="v">${esc(f.hydrantDistanceFeet.value)} ft</div>${src(f.hydrantDistanceFeet)}</div>` : ""}
 ${f.floodplain100yr?.confirmed ? `<div class="fact"><div class="k">Flood Risk</div><div class="v">${esc(f.floodplain100yr.value)}</div>${src(f.floodplain100yr)}</div>` : ""}
+${f.septicSuitability?.confirmed ? `<div class="fact"><div class="k">Septic Suitability</div><div class="v">${esc(f.septicSuitability.value)}</div>${src(f.septicSuitability)}</div>` : ""}
+${f.soilSeries?.confirmed ? `<div class="fact"><div class="k">Soil</div><div class="v">${esc(f.soilSeries.value)}</div>${src(f.soilSeries)}</div>` : ""}
+${f.farmlandClass?.confirmed ? `<div class="fact"><div class="k">Farmland Class</div><div class="v">${esc(f.farmlandClass.value)}</div>${src(f.farmlandClass)}</div>` : ""}
 ${f.roadFrontage?.confirmed ? `<div class="fact"><div class="k">Road Frontage</div><div class="v">${esc(f.roadFrontage.value)} ft</div>${src(f.roadFrontage)}</div>` : ""}
 ${f.jurisdiction?.confirmed ? `<div class="fact"><div class="k">Jurisdiction</div><div class="v">${esc(f.jurisdiction.value)}</div>${src(f.jurisdiction)}</div>` : ""}
 ${f.lastSale?.confirmed ? `<div class="fact"><div class="k">Last Recorded Sale</div><div class="v">${money(f.lastSale.value.price)} &middot; ${esc(f.lastSale.value.date)}</div>${src(f.lastSale)}</div>` : ""}
