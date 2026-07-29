@@ -13,14 +13,65 @@ function money(n) {
   return "$" + Number(n).toLocaleString("en-US");
 }
 
+// A fact is printed only when an authoritative source confirmed it. Anything
+// else is shown as unconfirmed with the body that can confirm it — never as a
+// guess, and never silently omitted.
+function fv(f, suffix = "") {
+  if (f && f.confirmed && f.value !== null && f.value !== undefined && f.value !== "") {
+    return `${esc(f.value)}${suffix}`;
+  }
+  const who = f && f.verifyWith ? esc(f.verifyWith) : "the county";
+  return `<span class="unconf">Not confirmed &mdash; pending ${who}</span>`;
+}
+function src(f) {
+  return f && f.confirmed && f.source
+    ? `<div class="src">Source: ${esc(f.source)}</div>`
+    : "";
+}
+
 function render(d, slug) {
   const range = `${money(d.value_low)} – ${money(d.value_high)}`;
   const comps = (d.comps || [])
     .map(
-      (c) => `<div class="comp"><div><div class="where">${esc(c.location)}</div><div class="desc">${esc(c.desc)}</div></div><div class="num"><div class="price">${esc(c.price)}</div><div class="peracre">${esc(c.per_acre)}</div></div></div>`
+      (c) => `<div class="comp"><div><div class="where">${esc(c.location)}<span class="compstatus ${c.status === "sold" ? "sold" : ""}">${esc(c.status || "listing")}${c.sale_date ? " " + esc(c.sale_date) : ""}</span></div><div class="desc">${esc(c.desc)}</div></div><div class="num"><div class="price">${esc(c.price)}</div><div class="peracre">${esc(c.per_acre)}</div></div></div>`
     )
     .join("");
   const date = new Date(d.generated).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+
+  const f = d.facts || {};
+  const s = d.structures;
+
+  // Improved parcels get an explicit structures block. Reporting an improved
+  // property as raw land was the single biggest defect in the first version.
+  const struct = s
+    ? `<div class="struct"><div class="k">Improvements on the property</div>
+<div class="strow">${[
+        s.count ? `${esc(s.count)} building${s.count > 1 ? "s" : ""}` : null,
+        s.type ? esc(s.type) : null,
+        s.yearBuilt ? `built ${esc(s.yearBuilt)}` : null,
+        s.squareFeet ? `${esc(s.squareFeet)} sq ft` : null,
+        s.stories ? `${esc(s.stories)} story` : null,
+      ]
+        .filter(Boolean)
+        .join(" &middot; ")}</div>
+<div class="src">Source: ${esc(d.county)} County Assessor building record</div></div>`
+    : `<div class="struct"><div class="k">Improvements on the property</div>
+<div class="strow">No buildings recorded on this parcel.</div>
+<div class="src">Source: ${esc(d.county)} County Assessor building record</div></div>`;
+
+  const unconf =
+    Array.isArray(d.unconfirmed) && d.unconfirmed.length
+      ? `<div class="unconfbox"><div class="k">Not yet confirmed</div><p>The following could not be confirmed from public records and should be verified before relying on them: ${esc(
+          d.unconfirmed.join("; ")
+        )}.</p></div>`
+      : "";
+
+  const basisLabel =
+    d.valuation_basis === "as-improved"
+      ? "Land and improvements"
+      : d.valuation_basis === "land-only"
+      ? "Land value"
+      : "Based on current market data and public records";
 
   return `<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -63,6 +114,16 @@ section{padding:36px 24px;border-bottom:1px solid var(--rule)}
 .comp .num{text-align:right;flex:none}.comp .price{font-family:'Cormorant Garamond',serif;font-size:22px;font-weight:600}
 .comp .peracre{font-size:11.5px;color:var(--gold);font-weight:600}
 .comps-note{margin-top:14px;font-size:12.5px;color:var(--muted);border-left:2px solid var(--tan);padding-left:12px}
+.src{font-size:10px;color:var(--muted);margin-top:5px;line-height:1.35}
+.unconf{color:#8A6D3B;font-weight:600}
+.struct{margin-top:18px;background:var(--card);border:1px solid var(--rule);border-radius:10px;padding:16px}
+.struct .k{font-size:10.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.strow{font-size:14.5px;font-weight:600;line-height:1.45}
+.unconfbox{margin-top:14px;border-left:2px solid #C8965A;padding-left:12px}
+.unconfbox .k{font-size:10.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
+.unconfbox p{font-size:12.5px;color:var(--muted);line-height:1.6}
+.compstatus{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:4px;background:var(--rule);color:var(--muted);margin-left:6px;vertical-align:middle}
+.compstatus.sold{background:#E4EEE4;color:#3D6B3D}
 .callout{background:var(--card);border:1px solid var(--rule);border-left:3px solid var(--gold);border-radius:10px;padding:20px}
 .callout .k{font-size:10.5px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--gold);margin-bottom:8px}
 .callout p{font-size:14px;line-height:1.65}
@@ -86,14 +147,23 @@ footer .disclaimer{margin-top:16px;font-size:11px;line-height:1.6;max-width:520p
 </header>
 <div class="hero"><div class="eyebrow">Opinion of Market Value</div>
 <div class="range">${money(d.value_low)}<em>–</em>${money(d.value_high)}</div>
-<div class="basis">Based on current market data and public records</div></div>
+<div class="basis">${esc(basisLabel)} &middot; based on current market data and public records</div></div>
 <section><div class="sec-title">Your Property</div><div class="sec-sub">As recorded with the ${esc(d.county)} County Assessor</div>
 <div class="facts">
-<div class="fact"><div class="k">Acreage</div><div class="v">${esc(d.acres)} deeded acres</div></div>
-<div class="fact"><div class="k">Zoning</div><div class="v">${esc(d.facts?.zoning_guess || "See report")}</div></div>
-<div class="fact"><div class="k">Utilities</div><div class="v">${esc(d.facts?.utilities_guess || "See report")}</div></div>
+<div class="fact"><div class="k">Acreage</div><div class="v">${esc(d.acres)} deeded acres</div>${src(f.acreage)}</div>
+<div class="fact"><div class="k">Zoning</div><div class="v">${fv(f.zoning)}</div>${src(f.zoning)}</div>
+<div class="fact"><div class="k">Water</div><div class="v">${fv(f.water)}</div>${src(f.water)}</div>
+<div class="fact"><div class="k">Sewer</div><div class="v">${fv(f.sewer)}</div>${src(f.sewer)}</div>
+<div class="fact"><div class="k">Electric</div><div class="v">${fv(f.electric)}</div>${src(f.electric)}</div>
 <div class="fact"><div class="k">Parcel</div><div class="v">${esc(d.parcel_id)}</div></div>
-</div></section>
+${f.slopeAverage?.confirmed ? `<div class="fact"><div class="k">Average Slope</div><div class="v">${esc(f.slopeAverage.value)}%</div>${src(f.slopeAverage)}</div>` : ""}
+${f.roadFrontage?.confirmed ? `<div class="fact"><div class="k">Road Frontage</div><div class="v">${esc(f.roadFrontage.value)} ft</div>${src(f.roadFrontage)}</div>` : ""}
+${f.jurisdiction?.confirmed ? `<div class="fact"><div class="k">Jurisdiction</div><div class="v">${esc(f.jurisdiction.value)}</div>${src(f.jurisdiction)}</div>` : ""}
+${f.lastSale?.confirmed ? `<div class="fact"><div class="k">Last Recorded Sale</div><div class="v">${money(f.lastSale.value.price)} &middot; ${esc(f.lastSale.value.date)}</div>${src(f.lastSale)}</div>` : ""}
+</div>
+${struct}
+${unconf}
+</section>
 <section><div class="sec-title">What the Market Shows</div><div class="sec-sub">Current land activity in your area</div>
 ${comps}<div class="comps-note">${esc(d.market_note)}</div></section>
 <section><div class="callout"><div class="k">Worth Knowing</div><p>${esc(d.strategic_note)}</p></div></section>
