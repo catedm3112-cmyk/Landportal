@@ -126,6 +126,11 @@ IMPROVEMENTS: ${
       : "No buildings found in the assessor record. Treat as vacant land."
   }
 
+${
+    facts.discrepancies?.length
+      ? `SOURCE CONFLICTS on this parcel — the assessor record has been used, but you must carry these into internal_flags and lower confidence accordingly:\n- ${facts.discrepancies.join("\n- ")}\n`
+      : ""
+  }
 UNCONFIRMED FIELDS — you must NOT invent values for these: ${unconfirmed.length ? unconfirmed.join("; ") : "(none)"}
 
 Adjoining parcels (owner | acres): ${adjoiners.map((x) => `${x.owner} | ${x.acres} ac`).join("; ") || "(none found)"}
@@ -331,6 +336,7 @@ export default async (req, res) => {
         intel.configured
           ? ""
           : `NOTE: ${countyName} County has no registered GIS source, so zoning/utilities/buildings could not be confirmed from public records. Add a source in lib/parcel-intel.js COUNTY_SOURCES to enable it.`,
+        facts.discrepancies?.length ? `⚠ SOURCE CONFLICTS:\n  - ${facts.discrepancies.join("\n  - ")}` : "",
         `Unconfirmed: ${unconfirmed.length ? unconfirmed.join("; ") : "none"}`,
         `Flags: ${val.internal_flags || "none"}`,
         `Report: ${reportUrl}`,
