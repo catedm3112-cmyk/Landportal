@@ -21,6 +21,11 @@ import {
   confirmedOnly,
   unconfirmedList,
 } from "../lib/parcel-intel.js";
+import {
+  radarConfigured,
+  resolveProperty,
+  ownerPortfolio,
+} from "../lib/propertyradar.js";
 
 const GHL_BASE = "https://services.leadconnectorhq.com";
 const GHL_KEY = process.env.GHL_API_KEY;
@@ -227,11 +232,57 @@ export default async (req, res) => {
     const fullAddr = req.body?.address || cfValue(contact, "full_property_address");
     const county = req.body?.county || cfValue(contact, "county");
 
+    // --- PropertyRadar first: current ownership AND the coordinates that drive
+    // every county lookup. Running it ahead of resolveParcel means a Land Portal
+    // outage or exhausted quota degrades one enrichment source instead of
+    // collapsing the whole fact chain.
+    // PropertyRadar's Address criteria matches the street line only — passing a
+    // full "street, city, ST zip" string returns zero results.
+    const parts = String(fullAddr || apn || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const zipMatch = String(fullAddr || "").match(/\b(\d{5})\b/);
+    const radarAddress = parts[0] || null;
+    const radarCity =
+      (parts[1] && !/^[A-Z]{2}$/i.test(parts[1]) && !/\d/.test(parts[1]) ? parts[1] : null) ||
+      cfValue(contact, "city") ||
+      null;
+
+    let radar = null;
+    if (radarConfigured() && radarAddress) {
+      try {
+        const found = await resolveProperty({
+          address: radarAddress,
+          city: radarCity,
+          state: "TN",
+          zip: zipMatch ? zipMatch[1] : null,
+        });
+        if (found.matched && found.property?.RadarID) {
+          const portfolio = await ownerPortfolio(found.property.RadarID);
+          radar = { property: found.property, ...portfolio };
+        } else {
+          radar = { unmatched: true, count: found.count, ambiguous: found.ambiguous || false };
+        }
+      } catch (e) {
+        radar = { error: e.message };
+      }
+    }
+
+    const radarHint = radar?.property
+      ? {
+          lat: Number(radar.property.Latitude) || null,
+          lng: Number(radar.property.Longitude) || null,
+          apn: radar.property.APN || null,
+        }
+      : null;
+
     // --- resolve, cross-validated ---
     const resolved = await resolveParcel({
       apn,
       address: fullAddr || apn,
       county,
+      hint: radarHint,
     });
 
     if (!resolved.ok || resolved.confidence < 60) {
@@ -255,12 +306,17 @@ export default async (req, res) => {
       });
     }
 
-    const countyName = resolved.lp?.situsCounty || resolved.tn?.attributes?.COUNTY_NAME || county || null;
+    const countyName =
+      resolved.lp?.situsCounty ||
+      resolved.tn?.attributes?.COUNTY_NAME ||
+      radar?.property?.County ||
+      county ||
+      null;
 
     // --- confirm facts from whatever county sources are registered ---
     const intel = await countyIntel(countyName, resolved.lat, resolved.lng);
 
-    const facts = buildFacts({ lp: resolved.lp, intel, countyName });
+    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar });
     const confirmed = confirmedOnly(facts);
     const unconfirmed = unconfirmedList(facts);
 
@@ -336,6 +392,16 @@ export default async (req, res) => {
         intel.configured
           ? ""
           : `NOTE: ${countyName} County has no registered GIS source, so zoning/utilities/buildings could not be confirmed from public records. Add a source in lib/parcel-intel.js COUNTY_SOURCES to enable it.`,
+        facts.currentOwner.confirmed
+          ? `Current owner (PropertyRadar): ${facts.currentOwner.value}${facts.freeAndClear.value === true ? " | FREE & CLEAR (no loan)" : ""}${facts.distressScore.value && facts.distressScore.value !== "0" ? ` | distress score ${facts.distressScore.value}` : ""}`
+          : "",
+        facts.ownerPortfolio.confirmed
+          ? `OWNER PORTFOLIO — ${facts.ownerPortfolio.value.totalParcels} parcel(s) total${facts.ownerPortfolio.value.age ? `, owner age ${facts.ownerPortfolio.value.age}` : ""}${facts.ownerPortfolio.value.mailAddress ? `, mails to ${facts.ownerPortfolio.value.mailAddress}` : ""}:\n` +
+            `  1. ${address} (subject)\n` +
+            facts.ownerPortfolio.value.otherParcels
+              .map((p, i) => `  ${i + 2}. ${p.address}`)
+              .join("\n")
+          : "",
         facts.discrepancies?.length ? `⚠ SOURCE CONFLICTS:\n  - ${facts.discrepancies.join("\n  - ")}` : "",
         `Unconfirmed: ${unconfirmed.length ? unconfirmed.join("; ") : "none"}`,
         `Flags: ${val.internal_flags || "none"}`,

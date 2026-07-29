@@ -59,6 +59,19 @@ function render(d, slug) {
 <div class="strow">No buildings recorded on this parcel.</div>
 <div class="src">Source: ${esc(d.county)} County Assessor building record</div></div>`;
 
+  // Owner holdings. Shown only when the owner holds more than the subject —
+  // these are the client's own properties, sourced from person-level linkage.
+  const p = f.ownerPortfolio?.confirmed ? f.ownerPortfolio.value : null;
+  const portfolio =
+    p && p.totalParcels > 1
+      ? `<div class="struct"><div class="k">Other property you own nearby</div>
+<div class="strow">${esc(p.totalParcels)} parcels total</div>
+<ul class="plist">${(p.otherParcels || [])
+          .map((x) => `<li>${esc(x.address)}</li>`)
+          .join("")}</ul>
+<div class="src">Source: ${esc(f.ownerPortfolio.source)}</div></div>`
+      : "";
+
   const unconf =
     Array.isArray(d.unconfirmed) && d.unconfirmed.length
       ? `<div class="unconfbox"><div class="k">Not yet confirmed</div><p>The following could not be confirmed from public records and should be verified before relying on them: ${esc(
@@ -119,6 +132,8 @@ section{padding:36px 24px;border-bottom:1px solid var(--rule)}
 .struct{margin-top:18px;background:var(--card);border:1px solid var(--rule);border-radius:10px;padding:16px}
 .struct .k{font-size:10.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
 .strow{font-size:14.5px;font-weight:600;line-height:1.45}
+.plist{margin:8px 0 0 18px;font-size:13.5px;line-height:1.7}
+.plist li{margin-bottom:2px}
 .unconfbox{margin-top:14px;border-left:2px solid #C8965A;padding-left:12px}
 .unconfbox .k{font-size:10.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
 .unconfbox p{font-size:12.5px;color:var(--muted);line-height:1.6}
@@ -166,6 +181,7 @@ ${f.jurisdiction?.confirmed ? `<div class="fact"><div class="k">Jurisdiction</di
 ${f.lastSale?.confirmed ? `<div class="fact"><div class="k">Last Recorded Sale</div><div class="v">${money(f.lastSale.value.price)} &middot; ${esc(f.lastSale.value.date)}</div>${src(f.lastSale)}</div>` : ""}
 </div>
 ${struct}
+${portfolio}
 ${unconf}
 </section>
 <section><div class="sec-title">What the Market Shows</div><div class="sec-sub">Current land activity in your area</div>

@@ -51,6 +51,10 @@
       "dest": "/api/track.js"
     },
     {
+      "src": "/api/radar-probe",
+      "dest": "/api/radar-probe.js"
+    },
+    {
       "src": "/r/([^/]+)",
       "dest": "/api/report.js?slug=$1"
     }
