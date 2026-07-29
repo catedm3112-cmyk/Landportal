@@ -175,7 +175,10 @@ footer .disclaimer{margin-top:16px;font-size:11px;line-height:1.6;max-width:520p
 <div class="fact"><div class="k">Sewer</div><div class="v">${fv(f.sewer)}</div>${src(f.sewer)}</div>
 <div class="fact"><div class="k">Electric</div><div class="v">${fv(f.electric)}</div>${src(f.electric)}</div>
 <div class="fact"><div class="k">Parcel</div><div class="v">${esc(d.parcel_id)}</div></div>
-${f.slopeAverage?.confirmed ? `<div class="fact"><div class="k">Average Slope</div><div class="v">${esc(f.slopeAverage.value)}%</div>${src(f.slopeAverage)}</div>` : ""}
+${f.slopeAverage?.confirmed ? `<div class="fact"><div class="k">Average Slope</div><div class="v">${esc(f.slopeAverage.value)}% grade${f.slopeDegreesMean?.confirmed ? ` (${esc(f.slopeDegreesMean.value)}&deg;)` : ""}</div>${src(f.slopeAverage)}</div>` : ""}
+${f.sewerDistanceFeet?.confirmed ? `<div class="fact"><div class="k">Nearest Sewer</div><div class="v">${esc(f.sewerDistanceFeet.value)} ft</div>${src(f.sewerDistanceFeet)}</div>` : ""}
+${f.hydrantDistanceFeet?.confirmed ? `<div class="fact"><div class="k">Nearest Hydrant</div><div class="v">${esc(f.hydrantDistanceFeet.value)} ft</div>${src(f.hydrantDistanceFeet)}</div>` : ""}
+${f.floodplain100yr?.confirmed ? `<div class="fact"><div class="k">Flood Risk</div><div class="v">${esc(f.floodplain100yr.value)}</div>${src(f.floodplain100yr)}</div>` : ""}
 ${f.roadFrontage?.confirmed ? `<div class="fact"><div class="k">Road Frontage</div><div class="v">${esc(f.roadFrontage.value)} ft</div>${src(f.roadFrontage)}</div>` : ""}
 ${f.jurisdiction?.confirmed ? `<div class="fact"><div class="k">Jurisdiction</div><div class="v">${esc(f.jurisdiction.value)}</div>${src(f.jurisdiction)}</div>` : ""}
 ${f.lastSale?.confirmed ? `<div class="fact"><div class="k">Last Recorded Sale</div><div class="v">${money(f.lastSale.value.price)} &middot; ${esc(f.lastSale.value.date)}</div>${src(f.lastSale)}</div>` : ""}

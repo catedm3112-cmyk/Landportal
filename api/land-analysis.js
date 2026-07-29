@@ -21,6 +21,7 @@ import {
   confirmedOnly,
   unconfirmedList,
 } from "../lib/parcel-intel.js";
+import { terrainIntel } from "../lib/terrain.js";
 import {
   radarConfigured,
   resolveProperty,
@@ -316,7 +317,16 @@ export default async (req, res) => {
     // --- confirm facts from whatever county sources are registered ---
     const intel = await countyIntel(countyName, resolved.lat, resolved.lng);
 
-    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar });
+    // Slope from USGS over the real parcel polygon; sewer/hydrant/flood from
+    // TruTerra's own Sevier County GIS exports. No vendor quota involved.
+    const terrain = await terrainIntel({
+      rings: resolved.tn?.geometry?.rings || null,
+      lat: resolved.lat,
+      lng: resolved.lng,
+      county: countyName,
+    });
+
+    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar, terrain });
     const confirmed = confirmedOnly(facts);
     const unconfirmed = unconfirmedList(facts);
 
@@ -386,6 +396,12 @@ export default async (req, res) => {
           : `VACANT: no buildings in assessor record`,
         `Zoning: ${facts.zoning.confirmed ? `${facts.zoning.value} (confirmed — ${facts.zoning.source})` : `NOT CONFIRMED — verify with ${facts.zoning.verifyWith}`}`,
         `Utilities: water ${facts.water.value ?? "unconfirmed"} | sewer ${facts.sewer.value ?? "unconfirmed"} | electric ${facts.electric.value ?? "unconfirmed"}`,
+        facts.sewerDistanceFeet.confirmed || facts.slopeAverage.confirmed
+          ? `Terrain/utilities: ${facts.slopeAverage.confirmed ? `slope ${facts.slopeAverage.value}% avg grade (${facts.slopeDegreesMean.value}°), max ${facts.slopeMax.value}%` : "slope unconfirmed"}` +
+            `${facts.sewerDistanceFeet.confirmed ? ` | nearest sewer manhole ${facts.sewerDistanceFeet.value} ft` : ""}` +
+            `${facts.hydrantDistanceFeet.confirmed ? ` | nearest hydrant ${facts.hydrantDistanceFeet.value} ft` : ""}` +
+            `${facts.floodplain100yr.confirmed ? ` | ${facts.floodplain100yr.value}` : ""}`
+          : "",
         confirmed.lastSale ? `Last sale: $${confirmed.lastSale.price?.toLocaleString()} on ${confirmed.lastSale.date}` : "",
         nameMismatch,
         `Parcel match: ${resolved.confidence}% (${resolved.method})${resolved.issues.length ? ` — ${resolved.issues.join(" ")}` : ""}`,
