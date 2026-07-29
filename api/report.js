@@ -151,7 +151,11 @@ footer .disclaimer{margin-top:16px;font-size:11px;line-height:1.6;max-width:520p
 <section><div class="sec-title">Your Property</div><div class="sec-sub">As recorded with the ${esc(d.county)} County Assessor</div>
 <div class="facts">
 <div class="fact"><div class="k">Acreage</div><div class="v">${esc(d.acres)} deeded acres</div>${src(f.acreage)}</div>
-<div class="fact"><div class="k">Zoning</div><div class="v">${fv(f.zoning)}</div>${src(f.zoning)}</div>
+<div class="fact"><div class="k">Zoning</div><div class="v">${fv(f.zoning)}</div>${src(f.zoning)}${
+    f.zoningOrdinance?.confirmed
+      ? `<div class="src"><a href="${esc(f.zoningOrdinance.value)}" target="_blank" rel="noopener" style="color:var(--gold)">Read the zoning ordinance &rarr;</a></div>`
+      : ""
+  }</div>
 <div class="fact"><div class="k">Water</div><div class="v">${fv(f.water)}</div>${src(f.water)}</div>
 <div class="fact"><div class="k">Sewer</div><div class="v">${fv(f.sewer)}</div>${src(f.sewer)}</div>
 <div class="fact"><div class="k">Electric</div><div class="v">${fv(f.electric)}</div>${src(f.electric)}</div>

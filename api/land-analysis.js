@@ -15,8 +15,7 @@
 
 import {
   resolveParcel,
-  sevierCama,
-  sevierJurisdiction,
+  countyIntel,
   tnAdjoiners,
   buildFacts,
   confirmedOnly,
@@ -253,15 +252,10 @@ export default async (req, res) => {
 
     const countyName = resolved.lp?.situsCounty || resolved.tn?.attributes?.COUNTY_NAME || county || null;
 
-    // --- confirm facts from the assessor record (Sevier County) ---
-    let cama = null;
-    let jurisdiction = { inCityLimits: null, overlayDistrict: null };
-    if (resolved.lat != null && /sevier/i.test(countyName || "")) {
-      cama = await sevierCama(resolved.lat, resolved.lng);
-      jurisdiction = await sevierJurisdiction(resolved.lat, resolved.lng);
-    }
+    // --- confirm facts from whatever county sources are registered ---
+    const intel = await countyIntel(countyName, resolved.lat, resolved.lng);
 
-    const facts = buildFacts({ lp: resolved.lp, cama, jurisdiction, countyName });
+    const facts = buildFacts({ lp: resolved.lp, intel, countyName });
     const confirmed = confirmedOnly(facts);
     const unconfirmed = unconfirmedList(facts);
 
@@ -334,6 +328,9 @@ export default async (req, res) => {
         confirmed.lastSale ? `Last sale: $${confirmed.lastSale.price?.toLocaleString()} on ${confirmed.lastSale.date}` : "",
         nameMismatch,
         `Parcel match: ${resolved.confidence}% (${resolved.method})${resolved.issues.length ? ` — ${resolved.issues.join(" ")}` : ""}`,
+        intel.configured
+          ? ""
+          : `NOTE: ${countyName} County has no registered GIS source, so zoning/utilities/buildings could not be confirmed from public records. Add a source in lib/parcel-intel.js COUNTY_SOURCES to enable it.`,
         `Unconfirmed: ${unconfirmed.length ? unconfirmed.join("; ") : "none"}`,
         `Flags: ${val.internal_flags || "none"}`,
         `Report: ${reportUrl}`,
