@@ -162,7 +162,7 @@ footer .disclaimer{margin-top:16px;font-size:11px;line-height:1.6;max-width:520p
 </header>
 <div class="hero"><div class="eyebrow">Opinion of Market Value</div>
 <div class="range">${money(d.value_low)}<em>–</em>${money(d.value_high)}</div>
-<div class="basis">${esc(basisLabel)} &middot; based on current market data and public records</div></div>
+<div class="basis">${esc(basisLabel)} &middot; ${d.broker_adjusted ? "broker opinion of value, prepared by TruTerra Land Advisory" : "based on current market data and public records"}</div></div>
 <section><div class="sec-title">Your Property</div><div class="sec-sub">As recorded with the ${esc(d.county)} County Assessor</div>
 <div class="facts">
 <div class="fact"><div class="k">Acreage</div><div class="v">${esc(d.acres)} deeded acres</div>${src(f.acreage)}</div>
@@ -179,6 +179,7 @@ ${f.slopeAverage?.confirmed ? `<div class="fact"><div class="k">Average Slope</d
 ${f.sewerDistanceFeet?.confirmed ? `<div class="fact"><div class="k">Nearest Sewer</div><div class="v">${esc(f.sewerDistanceFeet.value)} ft</div>${src(f.sewerDistanceFeet)}</div>` : ""}
 ${f.hydrantDistanceFeet?.confirmed ? `<div class="fact"><div class="k">Nearest Hydrant</div><div class="v">${esc(f.hydrantDistanceFeet.value)} ft</div>${src(f.hydrantDistanceFeet)}</div>` : ""}
 ${f.floodplain100yr?.confirmed ? `<div class="fact"><div class="k">Flood Risk</div><div class="v">${esc(f.floodplain100yr.value)}</div>${src(f.floodplain100yr)}</div>` : ""}
+${f.surfaceWater?.confirmed ? `<div class="fact"><div class="k">Surface Water</div><div class="v">${esc(f.surfaceWater.value)}</div>${src(f.surfaceWater)}</div>` : ""}
 ${f.septicSuitability?.confirmed ? `<div class="fact"><div class="k">Septic Suitability</div><div class="v">${esc(f.septicSuitability.value)}</div>${src(f.septicSuitability)}</div>` : ""}
 ${f.soilSeries?.confirmed ? `<div class="fact"><div class="k">Soil</div><div class="v">${esc(f.soilSeries.value)}</div>${src(f.soilSeries)}</div>` : ""}
 ${f.farmlandClass?.confirmed ? `<div class="fact"><div class="k">Farmland Class</div><div class="v">${esc(f.farmlandClass.value)}</div>${src(f.farmlandClass)}</div>` : ""}

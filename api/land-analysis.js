@@ -23,6 +23,7 @@ import {
 } from "../lib/parcel-intel.js";
 import { terrainIntel } from "../lib/terrain.js";
 import { soilIntel, soilSummary } from "../lib/soils.js";
+import { hydroIntel, hydroSummary } from "../lib/hydro.js";
 import {
   radarConfigured,
   resolveProperty,
@@ -112,7 +113,7 @@ async function callClaude(prompt) {
     .join("\n");
 }
 
-function buildPrompt({ facts, confirmed, unconfirmed, adjoiners, subject }) {
+function buildPrompt({ facts, confirmed, unconfirmed, adjoiners, subject, override }) {
   const improved = facts.improved;
   const s = facts.structures;
 
@@ -142,6 +143,11 @@ UNCONFIRMED FIELDS — you must NOT invent values for these: ${unconfirmed.lengt
 
 Adjoining parcels (owner | acres): ${adjoiners.map((x) => `${x.owner} | ${x.acres} ac`).join("; ") || "(none found)"}
 
+${
+    override
+      ? `BROKER-SET VALUE — AUTHORITATIVE: TruTerra's licensed broker has set the opinion of value at $${override.low.toLocaleString()}–$${override.high.toLocaleString()} using MLS sold data you cannot access. Use EXACTLY these numbers for value_low and value_high. Write market_note and strategic_note so they are consistent with this range. Do NOT argue against it in client-facing text. If the public comps you find point somewhere materially different, say so ONLY in internal_flags.\n`
+      : ""
+  }
 TASK
 1. Search the web for comparable properties in the immediate corridor (same road, same zip, or adjacent zips). ${
     improved
@@ -327,9 +333,12 @@ export default async (req, res) => {
       county: countyName,
     });
 
-    const soil = await soilIntel(resolved.lat, resolved.lng);
+    const [soil, hydro] = await Promise.all([
+      soilIntel(resolved.lat, resolved.lng),
+      hydroIntel({ rings: resolved.tn?.geometry?.rings || null, lat: resolved.lat, lng: resolved.lng }),
+    ]);
 
-    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar, terrain, soil });
+    const facts = buildFacts({ lp: resolved.lp, intel, countyName, radar, terrain, soil, hydro });
     const confirmed = confirmedOnly(facts);
     const unconfirmed = unconfirmedList(facts);
 
@@ -338,8 +347,22 @@ export default async (req, res) => {
     const address =
       resolved.tn?.attributes?.ADDRESS || resolved.lp?.situsAddress || fullAddr || apn;
 
+    // A licensed broker with MLS access outranks a public-comp model. The
+    // override is passed into the prompt so the narrative is written around it
+    // rather than contradicting it, and the model's own figure is preserved in
+    // the stored JSON for internal comparison.
+    const override =
+      req.body?.valueOverride && Number(req.body.valueOverride.low) && Number(req.body.valueOverride.high)
+        ? {
+            low: Number(req.body.valueOverride.low),
+            high: Number(req.body.valueOverride.high),
+            note: req.body.valueOverride.note || null,
+          }
+        : null;
+
     const val = applyCompGuardrails(
       await runValuation({
+        override,
         facts,
         confirmed,
         unconfirmed,
@@ -347,6 +370,24 @@ export default async (req, res) => {
         subject: { address, county: countyName, apn: resolved.apn },
       })
     );
+
+    if (override) {
+      const modelLow = val.value_low;
+      const modelHigh = val.value_high;
+      val.value_low = override.low;
+      val.value_high = override.high;
+      val.broker_adjusted = {
+        set_by: "TruTerra broker review",
+        note: override.note || "Range set from MLS sold data.",
+        model_was_instructed: true,
+        echoed_low: modelLow,
+        echoed_high: modelHigh,
+      };
+      // The model is TOLD the broker range so the narrative stays consistent,
+      // which means its output is NOT an independent second opinion. Say so
+      // plainly rather than printing a bogus "model computed" comparison.
+      val.internal_flags = `BROKER-SET RANGE $${override.low.toLocaleString()}-$${override.high.toLocaleString()} (set from MLS sold data; the model was instructed to this range, so it is NOT an independent estimate — see the public-comp support band below). ${val.internal_flags || ""}`.trim();
+    }
 
     const report = {
       generated: new Date().toISOString(),
@@ -402,6 +443,7 @@ export default async (req, res) => {
         facts.septicSuitability.confirmed
           ? `SOIL/SEPTIC: ${soilSummary(soil)}`
           : "",
+        facts.surfaceWater.confirmed ? `SURFACE WATER: ${facts.surfaceWater.value}` : "",
         facts.sewerDistanceFeet.confirmed || facts.slopeAverage.confirmed
           ? `Terrain/utilities: ${facts.slopeAverage.confirmed ? `slope ${facts.slopeAverage.value}% avg grade (${facts.slopeDegreesMean.value}°), max ${facts.slopeMax.value}%` : "slope unconfirmed"}` +
             `${facts.sewerDistanceFeet.confirmed ? ` | nearest sewer manhole ${facts.sewerDistanceFeet.value} ft` : ""}` +
