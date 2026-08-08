@@ -14,7 +14,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { searchAndFetchProperty } from "../lib/landportal.js";
 import { scoreLead } from "../lib/scoring.js";
-import { runLeadIntake } from "../lib/intake.js";
+import { runLeadIntake, smartPropertyQuery } from "../lib/intake.js";
 import { getContact, cfValue } from "../lib/ghl.js";
 
 // Land Analysis contact custom fields (same map as api/land-analysis.js).
@@ -42,11 +42,7 @@ function buildServer() {
       state: z.string().optional().describe("Two-letter state code, default TN"),
     },
     async ({ propertyInput, owner, state }) => {
-      const r = await searchAndFetchProperty({
-        parcel: propertyInput,
-        owner,
-        state: state || "TN",
-      });
+      const r = await searchAndFetchProperty(smartPropertyQuery(propertyInput, owner, state));
       return json({
         success: r.success,
         matchType: r.matchType,
@@ -81,11 +77,7 @@ function buildServer() {
       let resolved = property || null;
       let matchType = "provided_object";
       if (!resolved) {
-        const r = await searchAndFetchProperty({
-          parcel: propertyInput,
-          owner,
-          state: state || "TN",
-        });
+        const r = await searchAndFetchProperty(smartPropertyQuery(propertyInput, owner, state));
         resolved = r.property;
         matchType = r.matchType;
       }
