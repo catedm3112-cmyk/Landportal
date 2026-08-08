@@ -12,5 +12,9 @@
   },
   "devDependencies": {
     "vercel": "^37.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
   }
 }
